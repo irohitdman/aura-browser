@@ -1,0 +1,709 @@
+// The Aura window: one shell view (sidebar, toolbar, panels) and one view per live tab.
+const path = require('path');
+const fs = require('fs');
+const { BaseWindow, WebContentsView, session, ipcMain, Menu, clipboard, shell, screen, dialog, app, nativeImage } = require('electron');
+const { uid, emptySpace, toUrl, SEARCH } = require('./state');
+const { tokens, SPACE_COLOURS, SPACE_ICONS } = require('./theme');
+const { READ_LOOK, PICK_TYPE, PICK_AREA, PICK_COLOUR } = require('./extract');
+const { lookToCss, KINDS } = require('./library');
+
+const ROOT = path.join(__dirname, '..', '..');
+const SRC = path.join(__dirname, '..');
+const SIDEBAR_W = 252, STRIP_W = 56, BAR_H = 40, PANEL_W = 340, GAP = 10;
+const NEWTAB = 'aura://newtab/';
+const INTERNAL_TITLES = { newtab: 'Daily', library: 'Library', history: 'History', downloads: 'Downloads', settings: 'Settings', error: 'Page didn’t load' };
+
+class Browser {
+  constructor(ctx) {
+    Object.assign(this, ctx); // state, library, history, downloads, passwords
+    this.d = this.state.data;
+    this.tabs = new Map();       // item id -> { view, space, loading, audible, look, find }
+    this.sessions = new Map();   // space id -> session
+    this.rt = { overlay: false, revealSide: false, revealBar: false, flash: null, downloadsActive: 0, focusAddress: 0 };
+    this.pushTimer = null;
+    this.win = null;
+  }
+
+  // ---------- spaces and sessions ----------
+  space(id = this.d.active) { return this.d.spaces.find(s => s.id === id); }
+  sp(id = this.d.active) { if (!this.d.sp[id]) this.d.sp[id] = emptySpace(); return this.d.sp[id]; }
+  theme(spaceId = this.d.active) {
+    const mode = this.d.ui.theme === 'system' ? (require('electron').nativeTheme.shouldUseDarkColors ? 'dark' : 'light') : this.d.ui.theme;
+    return tokens(this.space(spaceId) || this.d.spaces[0], mode);
+  }
+
+  sessionFor(spaceId) {
+    if (this.sessions.has(spaceId)) return this.sessions.get(spaceId);
+    const ses = session.fromPartition('persist:space-' + spaceId);
+    this.setupSession(ses);
+    this.sessions.set(spaceId, ses);
+    return ses;
+  }
+
+  setupSession(ses) {
+    ses.setUserAgent(app.userAgentFallback);
+    this.protocolHandler(ses);
+    ses.on('will-download', (_e, item) => {
+      const dir = app.getPath('downloads');
+      let name = item.getFilename();
+      let target = path.join(dir, name);
+      const ext = path.extname(name), base = path.basename(name, ext);
+      for (let i = 1; fs.existsSync(target) && i < 500; i++) target = path.join(dir, `${base} (${i})${ext}`);
+      item.setSavePath(target);
+      this.rt.downloadsActive++;
+      const rec = this.downloads.track(item, (r, done) => {
+        if (done) {
+          this.rt.downloadsActive = Math.max(0, this.rt.downloadsActive - 1);
+          if (r.state === 'completed') {
+            this.flash({ icon: 'download', title: 'Downloaded', text: path.basename(r.path), actions: [['Show in Finder', 'dl-show:' + r.id], ['Open', 'dl-open:' + r.id]] }, 8000);
+            if (process.platform === 'darwin') app.dock.downloadFinished(r.path);
+          }
+        }
+        this.broadcastInternal('downloads');
+        this.push();
+      });
+      this.flash({ icon: 'download', title: 'Downloading', text: rec.name, actions: [['Downloads', 'open:aura://downloads/']] }, 4000);
+    });
+    // Extensions the person added in Settings (unpacked Chrome extensions).
+    for (const p of this.d.settings.extensions || []) {
+      const api = ses.extensions || ses;
+      api.loadExtension(p, { allowFileAccess: true }).catch(e => console.warn('extension failed', p, e.message));
+    }
+  }
+
+  protocolHandler(ses) {
+    if (ses.protocol.isProtocolHandled('aura')) return;
+    ses.protocol.handle('aura', (req) => {
+      const u = new URL(req.url);
+      let file;
+      const p = decodeURIComponent(u.pathname);
+      if (p === '/' || p === '') file = path.join(SRC, 'pages', (u.host === 'newtab' ? 'daily' : INTERNAL_TITLES[u.host] ? u.host : 'error') + '.html');
+      else if (p.startsWith('/fonts/')) file = path.join(ROOT, 'assets', 'fonts', path.basename(p));
+      else if (p.startsWith('/shot/')) {
+        const [, , id, name] = p.split('/');
+        if (!/^[a-z0-9]+$/i.test(id) || !/^(shot\.png|thumb\.jpg)$/.test(name)) return new Response('no', { status: 404 });
+        file = this.library.file(id, name);
+      } else file = path.join(SRC, 'pages', path.normalize(p).replace(/^([/\\])+/, ''));
+      if (!file.startsWith(SRC) && !file.startsWith(ROOT) && !file.startsWith(this.library.root)) return new Response('no', { status: 403 });
+      try {
+        const body = fs.readFileSync(file);
+        const type = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.woff2': 'font/woff2', '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml', '.json': 'application/json' }[path.extname(file)] || 'application/octet-stream';
+        return new Response(body, { headers: { 'content-type': type, 'cache-control': 'no-cache' } });
+      } catch (e) {
+        return new Response('Not found', { status: 404 });
+      }
+    });
+  }
+
+  // ---------- window ----------
+  open() {
+    const b = this.d.bounds || {};
+    const area = screen.getPrimaryDisplay().workArea;
+    const t = this.theme();
+    this.win = new BaseWindow({
+      width: b.width || Math.min(1440, area.width), height: b.height || Math.min(900, area.height),
+      x: b.x, y: b.y, minWidth: 760, minHeight: 480,
+      titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 18, y: 14 },
+      backgroundColor: t.body, title: 'Aura', show: false
+    });
+    if (process.platform !== 'darwin') this.win.setMenuBarVisibility(false);
+    this.shell = new WebContentsView({
+      webPreferences: { preload: path.join(SRC, 'preload', 'shell.js'), contextIsolation: true, sandbox: true, nodeIntegration: false }
+    });
+    this.shell.setBackgroundColor(t.body);
+    this.win.contentView.addChildView(this.shell);
+    this.shell.webContents.loadFile(path.join(SRC, 'shell', 'index.html'));
+    this.shell.webContents.on('did-finish-load', () => { this.push(true); this.win.show(); });
+    if (process.argv.includes('--dev')) this.shell.webContents.openDevTools({ mode: 'detach' });
+
+    const saveBounds = () => { if (!this.win.isFullScreen() && !this.win.isMaximized()) { this.d.bounds = this.win.getBounds(); this.state.save(); } };
+    this.win.on('resize', () => { this.layout(); saveBounds(); });
+    this.win.on('move', saveBounds);
+    this.win.on('enter-full-screen', () => this.layout());
+    this.win.on('leave-full-screen', () => this.layout());
+    this.win.on('focus', () => this.push());
+    this.win.on('closed', () => { this.win = null; this.tabs.clear(); clearInterval(this.edgeTimer); });
+
+    // Restore: the current tab of the current Space comes back live, the rest wait asleep.
+    const cur = this.sp();
+    if (!cur.activeId || !this.locate(cur.activeId)) this.newTab({ focus: false });
+    else this.activate(cur.activeId);
+    this.layout();
+    this.startEdgeWatch();
+  }
+
+  // Where the page sits. Panels push the page aside; nothing covers it at rest.
+  frame() {
+    const [W, H] = this.win.getContentSize();
+    const ui = this.d.ui;
+    const sideW = ui.sidebar === 'full' ? SIDEBAR_W : ui.sidebar === 'icons' ? STRIP_W : (this.rt.revealSide ? SIDEBAR_W : 0);
+    const barH = (ui.toolbar || this.rt.revealBar) ? BAR_H : 0;
+    const panelW = ui.panel ? PANEL_W : 0;
+    const calm = sideW === 0 && barH === 0 && !panelW;
+    if (calm) return { x: 0, y: 0, width: W, height: H, r: 0, sideW, barH, panelW, W, H };
+    const x = sideW ? sideW + 2 : GAP;
+    const y = barH || GAP;
+    return { x, y, width: Math.max(100, W - x - GAP - panelW), height: Math.max(100, H - y - GAP), r: 12, sideW, barH, panelW, W, H };
+  }
+
+  layout() {
+    if (!this.win) return;
+    const [W, H] = this.win.getContentSize();
+    this.shell.setBounds({ x: 0, y: 0, width: W, height: H });
+    const f = this.frame();
+    const cur = this.current();
+    for (const [id, t] of this.tabs) {
+      const show = cur && id === cur.id && !this.rt.overlay;
+      t.view.setVisible(show);
+      // The page sits 1px inside the frame so its hairline edge stays visible.
+      const i = f.r ? 1 : 0;
+      if (show) { t.view.setBounds({ x: f.x + i, y: f.y + i, width: f.width - 2 * i, height: f.height - 2 * i }); t.view.setBorderRadius(Math.max(0, f.r - i)); }
+    }
+    if (process.platform === 'darwin') {
+      const ui = this.d.ui;
+      const lightsVisible = ui.sidebar !== 'hidden' || this.rt.revealSide || ui.toolbar || this.rt.revealBar;
+      this.win.setWindowButtonVisibility(lightsVisible && !this.win.isFullScreen());
+      this.win.setWindowButtonPosition(ui.sidebar === 'icons' || (ui.sidebar === 'hidden' && !this.rt.revealSide) ? { x: (ui.sidebar === 'icons' ? STRIP_W : 0) + 14, y: 14 } : { x: 18, y: 14 });
+    }
+    this.push();
+  }
+
+  // Hide mode: point at the left edge for the sidebar, the top edge for the toolbar.
+  startEdgeWatch() {
+    let leftAt = 0;
+    this.edgeTimer = setInterval(() => {
+      if (!this.win || !this.win.isFocused()) return;
+      const ui = this.d.ui;
+      if (ui.sidebar !== 'hidden' && ui.toolbar) { if (this.rt.revealSide || this.rt.revealBar) { this.rt.revealSide = this.rt.revealBar = false; this.layout(); } return; }
+      const p = screen.getCursorScreenPoint();
+      const b = this.win.getContentBounds();
+      const inside = p.x >= b.x - 2 && p.x <= b.x + b.width && p.y >= b.y - 2 && p.y <= b.y + b.height;
+      const x = p.x - b.x, y = p.y - b.y;
+      let side = this.rt.revealSide, bar = this.rt.revealBar;
+      if (ui.sidebar === 'hidden') {
+        if (inside && x <= 4) side = true;
+        else if (side && (x > SIDEBAR_W + 24 || !inside)) { if (!leftAt) leftAt = Date.now(); if (Date.now() - leftAt > 220) side = false; }
+        else leftAt = 0;
+      } else side = false;
+      if (!ui.toolbar) {
+        if (inside && y <= 4 && x > (side || ui.sidebar !== 'hidden' ? 0 : 0)) bar = true;
+        else if (bar && (y > BAR_H + 30 || !inside)) bar = false;
+      } else bar = false;
+      if (this.rt.overlay) return;
+      if (side !== this.rt.revealSide || bar !== this.rt.revealBar) { this.rt.revealSide = side; this.rt.revealBar = bar; this.layout(); }
+    }, 70);
+  }
+
+  // ---------- items: pins, folders, Today ----------
+  locate(id, spaceId) {
+    const spaces = spaceId ? [spaceId] : Object.keys(this.d.sp);
+    for (const s of spaces) {
+      const sp = this.d.sp[s];
+      if (!sp) continue;
+      let i = sp.pins.findIndex(x => x.id === id);
+      if (i >= 0) return { space: s, list: sp.pins, index: i, item: sp.pins[i], where: 'pins' };
+      i = sp.today.findIndex(x => x.id === id);
+      if (i >= 0) return { space: s, list: sp.today, index: i, item: sp.today[i], where: 'today' };
+      for (const f of sp.folders) {
+        i = f.items.findIndex(x => x.id === id);
+        if (i >= 0) return { space: s, list: f.items, index: i, item: f.items[i], where: 'folder', folder: f };
+      }
+    }
+    return null;
+  }
+  current() { const id = this.sp().activeId; const l = id && this.locate(id, this.d.active); return l ? l.item : null; }
+  currentTab() { const c = this.current(); return c ? this.tabs.get(c.id) : null; }
+  orderedItems(spaceId = this.d.active) {
+    const sp = this.sp(spaceId);
+    const out = [...sp.pins];
+    sp.folders.forEach(f => out.push(...f.items));
+    out.push(...sp.today);
+    return out;
+  }
+
+  newTab({ url, focus = true, after, background } = {}) {
+    const item = { id: uid('t'), url: url || NEWTAB, title: url ? url.replace(/^https?:\/\/(www\.)?/, '') : 'Daily', fav: null, ts: Date.now() };
+    const sp = this.sp();
+    if (after) {
+      const l = this.locate(after, this.d.active);
+      if (l && l.where === 'today') sp.today.splice(l.index + 1, 0, item); else sp.today.push(item);
+    } else sp.today.push(item);
+    if (background) this.ensureView(item, this.d.active);
+    else this.activate(item.id);
+    if (focus && !url) this.rt.focusDaily = Date.now();
+    this.state.save();
+    return item;
+  }
+
+  ensureView(item, spaceId) {
+    let t = this.tabs.get(item.id);
+    if (t) return t;
+    const view = new WebContentsView({
+      webPreferences: {
+        session: this.sessionFor(spaceId), preload: path.join(SRC, 'preload', 'web.js'),
+        contextIsolation: true, sandbox: true, nodeIntegration: false, scrollBounce: true, spellcheck: true
+      }
+    });
+    view.setBackgroundColor(/^aura:/.test(item.url) ? this.theme(spaceId).body : '#FFFFFF');
+    view.setVisible(false);
+    this.win.contentView.addChildView(view);
+    t = { view, id: item.id, space: spaceId, loading: false, audible: false, look: null, find: null };
+    this.tabs.set(item.id, t);
+    this.wire(t);
+    view.webContents.loadURL(item.url).catch(() => {});
+    return t;
+  }
+
+  wire(t) {
+    const wc = t.view.webContents;
+    const item = () => { const l = this.locate(t.id); return l && l.item; };
+    const isCur = () => { const c = this.current(); return c && c.id === t.id; };
+    wc.on('page-title-updated', (_e, title) => { const it = item(); if (it) { it.title = title; this.history.title(wc.getURL(), title); this.state.save(); this.push(); } });
+    wc.on('page-favicon-updated', (_e, favs) => { const it = item(); if (it && favs && favs.length) { it.fav = favs.find(f => /\.(png|svg|ico)/i.test(f)) || favs[0]; this.state.save(); this.push(); } });
+    wc.on('did-start-loading', () => { t.loading = true; this.push(); });
+    wc.on('did-stop-loading', () => { t.loading = false; this.push(); });
+    const nav = (_e, url) => {
+      const it = item();
+      if (it) {
+        it.url = url;
+        const internal = url.match(/^aura:\/\/([a-z]+)/);
+        if (internal) { it.title = INTERNAL_TITLES[internal[1]] || it.title; it.fav = null; }
+        this.state.save();
+      }
+      t.look = null; t.find = null;
+      if (this.d.settings.keepHistory) this.history.add({ url, title: wc.getTitle(), space: t.space });
+      this.push();
+    };
+    wc.on('did-navigate', nav);
+    wc.on('did-navigate-in-page', (e, url, isMain) => { if (isMain) { const it = item(); if (it) { it.url = url; this.state.save(); } this.push(); } });
+    wc.on('did-finish-load', () => {
+      const url = wc.getURL();
+      if (/^(https?|file):/.test(url)) setTimeout(() => this.readLook(t).catch(() => {}), 700);
+    });
+    wc.on('did-fail-load', (_e, code, desc, url, isMain) => {
+      if (!isMain || code === -3 || code === -27) return;
+      wc.loadURL('aura://error/?code=' + code + '&desc=' + encodeURIComponent(desc) + '&url=' + encodeURIComponent(url)).catch(() => {});
+    });
+    wc.on('audio-state-changed', (e) => { t.audible = e.audible; this.push(); });
+    wc.on('found-in-page', (_e, r) => { if (t.find) { t.find.matches = r.matches; t.find.active = r.activeMatchOrdinal; this.push(); } });
+    wc.on('render-process-gone', () => { t.crashed = true; this.push(); });
+    wc.on('enter-html-full-screen', () => { this.rt.htmlFull = true; this.preFull = { ...this.d.ui }; this.d.ui.sidebar = 'hidden'; this.d.ui.toolbar = false; this.d.ui.panel = false; this.layout(); });
+    wc.on('leave-html-full-screen', () => { this.rt.htmlFull = false; if (this.preFull) Object.assign(this.d.ui, this.preFull); this.layout(); });
+    wc.setWindowOpenHandler(({ url, disposition, features }) => {
+      if (disposition === 'new-window' && features) {
+        // Sign-in popups and the like keep their opener.
+        return { action: 'allow', overrideBrowserWindowOptions: { width: 520, height: 680, autoHideMenuBar: true, backgroundColor: '#FFFFFF' } };
+      }
+      if (/^(https?|aura):/.test(url)) this.newTab({ url, after: t.id, background: disposition === 'background-tab' });
+      return { action: 'deny' };
+    });
+    wc.on('context-menu', (_e, p) => this.pageMenu(t, p));
+    wc.on('zoom-changed', (_e, dir) => { const z = wc.getZoomLevel() + (dir === 'in' ? 0.5 : -0.5); wc.setZoomLevel(Math.max(-5, Math.min(5, z))); this.push(); });
+  }
+
+  activate(id) {
+    const l = this.locate(id);
+    if (!l) return;
+    if (l.space !== this.d.active) this.d.active = l.space;
+    const sp = this.sp(l.space);
+    sp.activeId = id;
+    l.item.ts = Date.now();
+    const t = this.ensureView(l.item, l.space);
+    this.rt.flashTab = null;
+    this.layout();
+    if (!this.rt.overlay) t.view.webContents.focus();
+    this.state.save();
+  }
+
+  closeTab(id) {
+    id = id || (this.current() && this.current().id);
+    const l = this.locate(id);
+    if (!l) return;
+    const t = this.tabs.get(id);
+    const wasCurrent = this.sp(l.space).activeId === id;
+    if (t) { this.win.contentView.removeChildView(t.view); t.view.webContents.close(); this.tabs.delete(id); }
+    if (l.where === 'today') {
+      l.list.splice(l.index, 1);
+      if (!/^aura:\/\/newtab/.test(l.item.url)) { this.d.closed.unshift({ ...l.item, space: l.space }); this.d.closed.length = Math.min(this.d.closed.length, 30); }
+    }
+    if (wasCurrent) {
+      const sp = this.sp(l.space);
+      let next = null;
+      if (l.where === 'today') next = sp.today[Math.min(l.index, sp.today.length - 1)];
+      if (!next) next = [...sp.today].sort((a, b) => b.ts - a.ts)[0];
+      if (!next) next = this.orderedItems(l.space).find(i => this.tabs.has(i.id));
+      sp.activeId = null;
+      if (next) this.activate(next.id); else this.newTab({ focus: false });
+    }
+    this.state.save();
+    this.layout();
+  }
+
+  reopenClosed() {
+    const it = this.d.closed.shift();
+    if (!it) return;
+    if (it.space && it.space !== this.d.active && this.space(it.space)) this.switchSpace(it.space);
+    this.newTab({ url: it.url });
+  }
+
+  sleep(id) {
+    const t = this.tabs.get(id);
+    if (!t) return;
+    const wasCur = this.current() && this.current().id === id;
+    this.win.contentView.removeChildView(t.view); t.view.webContents.close(); this.tabs.delete(id);
+    if (wasCur) {
+      const sp = this.sp();
+      const next = [...sp.today].sort((a, b) => b.ts - a.ts).find(i => i.id !== id);
+      sp.activeId = null;
+      if (next) this.activate(next.id); else this.newTab({ focus: false });
+    }
+    this.layout();
+  }
+
+  move(id, to) {
+    // to: { where: 'pins'|'today'|'folder', folderId, index }
+    const l = this.locate(id, this.d.active);
+    if (!l) return;
+    l.list.splice(l.index, 1);
+    const sp = this.sp();
+    let list = to.where === 'pins' ? sp.pins : to.where === 'folder' ? (sp.folders.find(f => f.id === to.folderId) || {}).items : sp.today;
+    if (!list) list = sp.today;
+    let i = to.index == null ? list.length : to.index;
+    if (list === l.list && to.index != null && l.index < to.index) i--;
+    i = Math.max(0, Math.min(list.length, i));
+    list.splice(i, 0, l.item);
+    if (to.where === 'folder') { const f = sp.folders.find(x => x.id === to.folderId); if (f) f.open = true; }
+    this.state.save(); this.push();
+  }
+
+  moveToSpace(id, spaceId) {
+    const l = this.locate(id);
+    if (!l || l.space === spaceId) return;
+    const t = this.tabs.get(id);
+    if (t) { this.win.contentView.removeChildView(t.view); t.view.webContents.close(); this.tabs.delete(id); }
+    l.list.splice(l.index, 1);
+    this.sp(spaceId).today.push(l.item);
+    if (this.sp(l.space).activeId === id) { this.sp(l.space).activeId = null; }
+    this.switchSpace(spaceId);
+    this.activate(id);
+  }
+
+  switchSpace(id) {
+    if (!this.space(id)) return;
+    this.d.active = id;
+    const sp = this.sp(id);
+    if (sp.activeId && this.locate(sp.activeId, id)) this.activate(sp.activeId);
+    else { sp.activeId = null; this.newTab({ focus: false }); }
+    const t = this.theme();
+    this.win.setBackgroundColor(t.body);
+    this.shell.setBackgroundColor(t.body);
+    this.broadcastInternal('theme');
+    this.state.save();
+    this.layout();
+  }
+
+  // ---------- navigation ----------
+  navigate(input, opts = {}) {
+    const url = toUrl(input, this.d.settings.search);
+    if (!url) return;
+    const cur = this.current();
+    if (opts.newTab || !cur) return this.newTab({ url });
+    const t = this.ensureView(cur, this.d.active);
+    cur.url = url;
+    t.view.webContents.loadURL(url).catch(() => {});
+    t.view.webContents.focus();
+    this.push();
+  }
+  wc() { const t = this.currentTab(); return t && t.view.webContents; }
+
+  // ---------- page look ----------
+  async readLook(t) {
+    const wc = t.view.webContents;
+    if (wc.isDestroyed() || !/^(https?|file):/.test(wc.getURL())) return null;
+    const look = await wc.executeJavaScript(READ_LOOK, false);
+    if (!/^(https?|file):/.test(wc.getURL())) return null;
+    t.look = look;
+    if (this.currentTab() === t) this.push();
+    return look;
+  }
+
+  async save(kind) {
+    const t = this.currentTab();
+    const cur = this.current();
+    if (!t || !cur) return;
+    const wc = t.view.webContents;
+    const url = wc.getURL();
+    if (!/^https?:/.test(url)) { this.flash({ icon: 'info', title: 'Nothing to save here', text: 'Open a website first.' }, 3000); return; }
+    const sp = this.space();
+    const base = { url, title: wc.getTitle() || cur.title, host: new URL(url).hostname.replace(/^www\./, ''), spaceId: sp.id, spaceName: sp.name, fav: cur.fav };
+    try {
+      if (kind === 'page' || kind === 'look') {
+        const look = await this.readLook(t).catch(() => t.look);
+        const image = await wc.capturePage();
+        const rec = this.library.add(Object.assign(base, { kind, look }), image);
+        if (kind === 'look' && !this.d.ui.panel) { this.d.ui.panel = true; this.layout(); }
+        this.flashSaved(rec);
+      } else if (kind === 'area') {
+        this.flash({ icon: 'area', title: 'Drag over the page', text: 'Esc to stop' }, 0);
+        wc.focus();
+        const rect = await wc.executeJavaScript(PICK_AREA, true);
+        this.unflash();
+        if (!rect) return;
+        await new Promise(r => setTimeout(r, 60));
+        const image = await wc.capturePage({ x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) });
+        const look = t.look || await this.readLook(t).catch(() => null);
+        const rec = this.library.add(Object.assign(base, { kind: 'area', look, rect }), image);
+        this.flashSaved(rec);
+      } else if (kind === 'type') {
+        this.flash({ icon: 'type', title: 'Click any text', text: 'to save its typeface. Esc to stop' }, 0);
+        wc.focus();
+        const type = await wc.executeJavaScript(PICK_TYPE, true);
+        this.unflash();
+        if (!type) return;
+        const r = type.rect;
+        const image = await wc.capturePage({ x: Math.round(r.x), y: Math.round(r.y), width: Math.max(10, Math.round(r.width)), height: Math.max(10, Math.round(r.height)) });
+        const look = t.look || await this.readLook(t).catch(() => null);
+        const rec = this.library.add(Object.assign(base, { kind: 'type', type, title: type.family + ' ' + type.weight, look }), image);
+        this.flashSaved(rec);
+      } else if (kind === 'colour') {
+        wc.focus();
+        const hex = await wc.executeJavaScript(PICK_COLOUR, true);
+        if (!hex) return;
+        const up = hex.toUpperCase();
+        clipboard.writeText(up);
+        const img = nativeImage.createFromBuffer(solidPng(up));
+        const rec = this.library.add(Object.assign(base, { kind: 'colour', colour: up, title: up + ' from ' + base.host }), img);
+        this.flashSaved(rec, 'Copied ' + up);
+      }
+    } catch (e) {
+      console.error('save failed', e);
+      this.flash({ icon: 'info', title: 'Couldn’t save', text: e.message.slice(0, 80) }, 4000);
+    }
+    this.broadcastInternal('library');
+  }
+
+  flashSaved(rec, extra) {
+    const what = { page: 'Page saved', look: 'This look saved', area: 'Area saved', type: 'Typeface saved', colour: 'Colour saved' }[rec.kind];
+    const look = rec.look || {};
+    const { describeColour } = require('./library');
+    const bits = [];
+    if (look.colours && look.colours.length) {
+      bits.push(look.dark ? 'dark' : 'light');
+      const acc = look.colours.find(c => c.role === 'Accent');
+      if (acc) bits.push(describeColour(acc.hex).filter(w => !['light', 'dark', 'bright', 'vivid', 'deep', 'pastel'].includes(w))[0] + ' accent');
+    }
+    if (rec.type) bits.push(rec.type.family + ' ' + rec.type.weight);
+    else if (look.faces && look.faces[0]) bits.push(look.faces[0].family);
+    if (look.values && look.values.motion && look.values.motion !== 'Still') bits.push(look.values.motion);
+    bits.push(rec.host);
+    const words = bits.filter(Boolean).join(', ');
+    this.flash({ icon: 'check', title: what, text: extra || words, actions: [['Find it later ⌘K', 'cmd'], ['Undo', 'undo-save:' + rec.id]], saved: true }, 7000);
+  }
+  flash(f, ms) {
+    clearTimeout(this.flashTimer);
+    this.rt.flash = Object.assign({ at: Date.now() }, f);
+    if (ms) this.flashTimer = setTimeout(() => { this.rt.flash = null; this.push(); }, ms);
+    this.push();
+  }
+  unflash() { clearTimeout(this.flashTimer); this.rt.flash = null; this.push(); }
+
+  // ---------- menus ----------
+  tabMenu(id) {
+    const l = this.locate(id, this.d.active);
+    if (!l) return;
+    const sp = this.sp();
+    const live = this.tabs.has(id);
+    const tmpl = [
+      { label: l.where === 'pins' ? 'Unpin' : 'Pin', click: () => this.move(id, { where: l.where === 'pins' ? 'today' : 'pins' }) },
+      { label: 'Move to folder', submenu: sp.folders.length ? sp.folders.map(f => ({ label: f.name, click: () => this.move(id, { where: 'folder', folderId: f.id }) })).concat([{ type: 'separator' }, { label: 'New folder…', click: () => { const f = this.folderCreate(); this.move(id, { where: 'folder', folderId: f.id }); } }]) : [{ label: 'New folder', click: () => { const f = this.folderCreate(); this.move(id, { where: 'folder', folderId: f.id }); } }] },
+      { label: 'Move to Space', submenu: this.d.spaces.filter(s => s.id !== this.d.active).map(s => ({ label: s.name, click: () => this.moveToSpace(id, s.id) })) },
+      { type: 'separator' },
+      { label: 'Copy address', click: () => clipboard.writeText(l.item.url) },
+      { label: 'Duplicate', click: () => this.newTab({ url: l.item.url, after: id }) },
+      { label: 'Reload', enabled: live, click: () => this.tabs.get(id) && this.tabs.get(id).view.webContents.reload() },
+      { type: 'separator' },
+      l.where === 'today' ? { label: 'Close tab', click: () => this.closeTab(id) } : { label: 'Put to sleep', enabled: live, click: () => this.sleep(id) },
+      l.where !== 'today' ? { label: 'Remove', click: () => { this.sleep(id); const k = this.locate(id); if (k) { k.list.splice(k.index, 1); this.state.save(); this.push(); } } } : null,
+      l.where === 'today' ? { label: 'Close tabs below', click: () => { const ids = sp.today.slice(l.index + 1).map(i => i.id); ids.forEach(x => this.closeTab(x)); } } : null
+    ].filter(Boolean);
+    Menu.buildFromTemplate(tmpl).popup({ window: this.win });
+  }
+
+  pageMenu(t, p) {
+    const wc = t.view.webContents;
+    const items = [];
+    if (p.linkURL) {
+      items.push({ label: 'Open link in new tab', click: () => this.newTab({ url: p.linkURL, after: t.id, background: true }) });
+      const others = this.d.spaces.filter(s => s.id !== t.space);
+      if (others.length) items.push({ label: 'Open link in Space', submenu: others.map(s => ({ label: s.name, click: () => { this.switchSpace(s.id); this.newTab({ url: p.linkURL }); } })) });
+      items.push({ label: 'Copy link', click: () => clipboard.writeText(p.linkURL) }, { type: 'separator' });
+    }
+    if (p.hasImageContents && p.srcURL) {
+      items.push({ label: 'Open image in new tab', click: () => this.newTab({ url: p.srcURL, after: t.id }) });
+      items.push({ label: 'Copy image', click: () => wc.copyImageAt(p.x, p.y) });
+      items.push({ label: 'Save image…', click: () => wc.downloadURL(p.srcURL) }, { type: 'separator' });
+    }
+    if (p.selectionText) {
+      const q = p.selectionText.trim().slice(0, 200);
+      items.push({ label: 'Copy', role: 'copy' });
+      items.push({ label: `Search for “${q.length > 30 ? q.slice(0, 30) + '…' : q}”`, click: () => this.newTab({ url: toUrl(q, this.d.settings.search), after: t.id }) }, { type: 'separator' });
+    }
+    if (p.isEditable) {
+      if (p.misspelledWord && p.dictionarySuggestions.length) {
+        p.dictionarySuggestions.slice(0, 4).forEach(s => items.push({ label: s, click: () => wc.replaceMisspelling(s) }));
+        items.push({ type: 'separator' });
+      }
+      items.push({ role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'selectAll' }, { type: 'separator' });
+    }
+    if (!p.linkURL && !p.selectionText && !p.isEditable) {
+      items.push({ label: 'Back', enabled: wc.navigationHistory.canGoBack(), click: () => wc.navigationHistory.goBack() });
+      items.push({ label: 'Forward', enabled: wc.navigationHistory.canGoForward(), click: () => wc.navigationHistory.goForward() });
+      items.push({ label: 'Reload', click: () => wc.reload() }, { type: 'separator' });
+      items.push({ label: 'Save whole view', accelerator: 'CmdOrCtrl+S', click: () => this.save('page') });
+      items.push({ label: 'Save this look', accelerator: 'CmdOrCtrl+Shift+S', click: () => this.save('look') });
+      items.push({ label: 'Save an area', click: () => this.save('area') });
+      items.push({ label: 'Save a typeface', click: () => this.save('type') }, { type: 'separator' });
+    }
+    items.push({ label: 'Inspect', click: () => { wc.inspectElement(p.x, p.y); } });
+    Menu.buildFromTemplate(items).popup({ window: this.win });
+  }
+
+  folderCreate(name) {
+    const f = { id: uid('f'), name: name || 'New folder', open: true, items: [] };
+    this.sp().folders.push(f);
+    this.rt.renameFolder = f.id;
+    this.state.save(); this.push();
+    return f;
+  }
+
+  // ---------- popovers ----------
+  // Popovers sit over the page. While one is open the page shows as a still image underneath.
+  async overlay(on) {
+    if (on === this.rt.overlay) return;
+    const t = this.currentTab();
+    if (on && t) {
+      try {
+        const img = await t.view.webContents.capturePage();
+        this.rt.still = img.toDataURL();
+      } catch (e) { this.rt.still = null; }
+    }
+    if (!on) this.rt.still = null;
+    this.rt.overlay = on;
+    this.push(true);
+    setTimeout(() => {
+      this.layout();
+      if (on) this.shell.webContents.focus(); else if (t) t.view.webContents.focus();
+    }, on ? 30 : 0);
+  }
+
+  // ---------- state to the shell ----------
+  push(now) {
+    if (!this.win || !this.shell) return;
+    clearTimeout(this.pushTimer);
+    const send = () => { if (this.shell && !this.shell.webContents.isDestroyed()) this.shell.webContents.send('state', this.snapshot()); };
+    if (now) send(); else this.pushTimer = setTimeout(send, 16);
+  }
+
+  snapshot() {
+    const sp = this.sp();
+    const cur = this.current();
+    const ct = this.currentTab();
+    const wc = ct && ct.view.webContents;
+    const dec = (it) => {
+      const t = this.tabs.get(it.id);
+      return { id: it.id, url: it.url, title: it.title || it.url, fav: it.fav, live: !!t, loading: !!(t && t.loading), audible: !!(t && t.audible), on: cur && cur.id === it.id };
+    };
+    const f = this.win ? this.frame() : null;
+    return {
+      platform: process.platform,
+      spaces: this.d.spaces, active: this.d.active,
+      pins: sp.pins.map(dec), folders: sp.folders.map(x => ({ id: x.id, name: x.name, open: x.open, items: x.items.map(dec) })), today: sp.today.map(dec),
+      ui: this.d.ui, settings: { search: this.d.settings.search, searchName: (SEARCH[this.d.settings.search] || SEARCH.google).name },
+      theme: this.theme(), frame: f, full: this.win && this.win.isFullScreen(),
+      rt: { overlay: this.rt.overlay, still: this.rt.overlay ? this.rt.still : null, revealSide: this.rt.revealSide, revealBar: this.rt.revealBar, flash: this.rt.flash, downloads: this.rt.downloadsActive, renameFolder: this.rt.renameFolder, focusDaily: this.rt.focusDaily },
+      page: cur ? {
+        id: cur.id, url: wc ? wc.getURL() || cur.url : cur.url, title: cur.title,
+        back: !!(wc && wc.navigationHistory.canGoBack()), fwd: !!(wc && wc.navigationHistory.canGoForward()),
+        loading: !!(ct && ct.loading), look: ct ? ct.look : null, find: ct ? ct.find : null,
+        zoom: wc ? Math.round(Math.pow(1.2, wc.getZoomLevel()) * 100) : 100, crashed: !!(ct && ct.crashed),
+        secure: /^https:/.test(cur.url),
+        savedLook: !!(wc && this.library.all().some(x => x.kind === 'look' && x.url === wc.getURL()))
+      } : null,
+      icons: SPACE_ICONS, colours: Object.keys(SPACE_COLOURS), saves: this.library.all().length
+    };
+  }
+
+  broadcastInternal(what) {
+    for (const t of this.tabs.values()) {
+      const wc = t.view.webContents;
+      if (!wc.isDestroyed() && /^aura:/.test(wc.getURL())) wc.send('aura:changed', what);
+    }
+  }
+
+  // ---------- command bar search ----------
+  commandResults(q) {
+    const s = String(q || '').trim();
+    const low = s.toLowerCase();
+    const out = [];
+    if (s) {
+      const url = toUrl(s, this.d.settings.search);
+      const isSearch = url && url.startsWith((SEARCH[this.d.settings.search] || SEARCH.google).url.split('%s')[0]);
+      out.push({ group: 'Go', kind: isSearch ? 'search' : 'url', title: isSearch ? s : url.replace(/^https?:\/\//, ''), sub: isSearch ? 'Search ' + (SEARCH[this.d.settings.search] || SEARCH.google).name : 'Open address', url });
+    }
+    // Open tabs in this Space
+    const tabs = this.orderedItems().filter(it => !low || (it.title || '').toLowerCase().includes(low) || (it.url || '').toLowerCase().includes(low)).slice(0, s ? 5 : 6);
+    tabs.forEach(it => out.push({ group: 'Tabs', kind: 'tab', id: it.id, title: it.title || it.url, sub: (it.url || '').replace(/^https?:\/\/(www\.)?/, '').slice(0, 70), fav: it.fav }));
+    // Saves, described in words
+    const saves = s ? this.library.search(s).slice(0, 5) : this.library.all().slice(0, 3);
+    saves.forEach(x => out.push({ group: 'Saves', kind: 'save', id: x.id, title: x.title, sub: (KINDS[x.kind] || x.kind).replace(/s$/, '') + ' from ' + (x.host || '') + ', ' + ago(x.created), thumb: x.hasShot ? `aura://library/shot/${x.id}/thumb.jpg` : null, colour: x.colour }));
+    if (s) this.history.suggest(s, 5).forEach(h => { if (!out.some(o => o.url === h.url)) out.push({ group: 'History', kind: 'url', title: h.title || h.url, sub: h.url.replace(/^https?:\/\/(www\.)?/, '').slice(0, 70), url: h.url }); });
+    // Commands
+    const cmds = [
+      ['New tab', 'cmd:newtab', '⌘T'], ['Library', 'open:aura://library/', '⌘⇧O'], ['History', 'open:aura://history/', '⌘Y'], ['Downloads', 'open:aura://downloads/', '⌥⌘L'],
+      ['Settings', 'open:aura://settings/', '⌘,'], ['Save whole view', 'save:page', '⌘S'], ['Save this look', 'save:look', '⌘⇧S'], ['Save a typeface', 'save:type', ''], ['Save a colour', 'save:colour', '⌘⇧C'], ['Save an area', 'save:area', '⌘⇧A'],
+      ['This page panel', 'cmd:panel', '⌘I'], ['Sidebar: always show', 'ui:sidebar:full', '⌘⇧1'], ['Sidebar: collapse to icons', 'ui:sidebar:icons', '⌘⇧2'], ['Sidebar: hide', 'ui:sidebar:hidden', '⌘⇧3'],
+      ['Light chrome', 'ui:theme:light', ''], ['Dark chrome', 'ui:theme:dark', ''], ['New Space', 'cmd:newspace', '⌘⇧N'], ['New folder', 'cmd:newfolder', ''], ['Make Aura the default browser', 'cmd:default', '']
+    ].concat(this.d.spaces.map((sp, i) => ['Switch to ' + sp.name, 'space:' + sp.id, i < 4 ? '⌃' + (i + 1) : '']));
+    cmds.filter(c => !low || c[0].toLowerCase().includes(low)).slice(0, s ? 4 : 0).forEach(c => out.push({ group: 'Commands', kind: 'cmd', title: c[0], action: c[1], key: c[2] }));
+    return out;
+  }
+}
+
+function ago(ts) {
+  const m = Math.round((Date.now() - ts) / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return m + ' min ago';
+  const h = Math.round(m / 60);
+  if (h < 24) return 'today';
+  const d = new Date(ts);
+  return d.getDate() + ' ' + d.toLocaleString('en-GB', { month: 'short' });
+}
+
+// A tiny solid PNG for colour saves.
+function solidPng(hex) {
+  const zlib = require('zlib');
+  const w = 240, h = 160;
+  const [r, g, b] = [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16));
+  const row = Buffer.alloc(1 + w * 3);
+  for (let x = 0; x < w; x++) { row[1 + x * 3] = r; row[2 + x * 3] = g; row[3 + x * 3] = b; }
+  const raw = Buffer.concat(Array(h).fill(row));
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const td = Buffer.concat([Buffer.from(type), data]);
+    const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(td) >>> 0);
+    return Buffer.concat([len, td, crc]);
+  };
+  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = 2;
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
+}
+function crc32(buf) {
+  let c, crc = 0xFFFFFFFF;
+  for (let n = 0; n < buf.length; n++) {
+    c = (crc ^ buf[n]) & 0xFF;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+    crc = (crc >>> 8) ^ c;
+  }
+  return crc ^ 0xFFFFFFFF;
+}
+
+module.exports = { Browser, lookToCss, NEWTAB };

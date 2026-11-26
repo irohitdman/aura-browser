@@ -1,0 +1,25 @@
+html, body { min-height: 100%; }
+.wrap { max-width: 880px; margin: 0 auto; padding: 40px 32px 64px; display: flex; flex-direction: column; gap: 18px; }
+.top { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
+h1 { margin: 0; font-size: 30px; font-weight: var(--wb); letter-spacing: -.02em; line-height: 1.1; }
+.sub { margin: 6px 0 0; color: var(--mute); font-size: 13px; }
+.day { margin-top: 14px; padding: 0 10px 6px; }
+.item { display: grid; grid-template-columns: 54px 20px minmax(0, 1fr) auto; align-items: center; gap: 12px; height: 40px; padding: 0 10px; border-radius: 10px; color: var(--ink); text-decoration: none; }
+.item:hover { background: var(--plate); }
+.item .tm { font: 500 11.5px var(--mono); color: var(--mute); }
+.item .fv { width: 16px; height: 16px; border-radius: 3px; display: grid; place-items: center; color: var(--mute); }
+.item .fv img { width: 16px; height: 16px; }
+.item .tt { display: flex; gap: 10px; min-width: 0; align-items: baseline; }
+.item .tt b { font-weight: 500; }
+.item .tt span { color: var(--mute); font-size: 12px; }
+.item .x { width: 26px; height: 26px; border-radius: 7px; display: grid; place-items: center; color: var(--mute); opacity: 0; }
+.item:hover .x { opacity: 1; }
+.item .x:hover { background: var(--key); color: var(--ink); }
+.dl { display: grid; grid-template-columns: 36px minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--plate); }
+.dl .ic { width: 36px; height: 36px; border-radius: 10px; background: var(--body); border: 1px solid var(--line); display: grid; place-items: center; color: var(--alu); }
+.dl b { font-weight: 500; display: block; }
+.dl small { display: block; color: var(--mute); font-size: 12px; margin-top: 2px; }
+.dl .bar { height: 3px; border-radius: 2px; background: var(--key); margin-top: 8px; overflow: hidden; }
+.dl .bar i { display: block; height: 100%; background: var(--accent); }
+.dl .acts { display: flex; gap: 6px; }
+.dl.gone b { color: var(--mute); text-decoration: line-through; }

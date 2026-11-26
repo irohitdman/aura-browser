@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src * data: blob: aura:; style-src 'self' 'unsafe-inline'; font-src 'self'; script-src 'self'">
+<title>Aura</title>
+<link rel="stylesheet" href="shell.css">
+</head>
+<body>
+  <div id="frame"><div id="still"></div><div id="shade"></div></div>
+
+  <aside id="side" aria-label="Sidebar">
+    <div class="stop drag"><button class="sbk nodrag" id="sbBtn" title="Sidebar and toolbar" data-act="smenu"></button></div>
+    <div class="pins" id="pins"></div>
+    <div class="scroll" id="scroll"></div>
+    <div class="sbar" id="sbar"></div>
+  </aside>
+  <aside id="strip" class="off" aria-label="Tabs"></aside>
+
+  <header id="bar" class="drag"></header>
+  <aside id="panel" class="off" aria-label="This page"></aside>
+
+  <div class="pop" id="saveMenu" role="menu"></div>
+  <div class="pop" id="smenu" role="menu"></div>
+  <div class="pop" id="nmenu" role="menu"></div>
+  <div class="pop" id="spaceEd" role="dialog" aria-label="Space"></div>
+  <div class="pop" id="cmd" role="dialog" aria-label="Command bar">
+    <div class="q"><span class="ic" id="cmdIc"></span><input id="cmdIn" placeholder="Search, enter an address, or describe a save" autocomplete="off" spellcheck="false"><kbd>esc</kbd></div>
+    <div class="res-list" id="cmdRes"></div>
+  </div>
+
+  <script src="icons.js"></script>
+  <script src="shell.js"></script>
+</body>
+</html>

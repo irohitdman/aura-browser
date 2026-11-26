@@ -1,0 +1,68 @@
+{
+  "name": "aura-browser",
+  "version": "0.1.0",
+  "description": "Aura, a browser for designers",
+  "main": "src/main/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "dist:mac": "electron-builder --mac --arm64 --x64",
+    "dist": "electron-builder"
+  },
+  "author": "Rohit",
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "electron": "^45.5.0",
+    "electron-builder": "^26.18.0",
+    "geist": "^1.9.2"
+  },
+  "productName": "Aura",
+  "private": true,
+  "build": {
+    "appId": "app.aura.browser",
+    "productName": "Aura",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        {
+          "target": "dmg"
+        },
+        {
+          "target": "zip"
+        }
+      ],
+      "icon": "build/icon.png",
+      "extendInfo": {
+        "CFBundleDocumentTypes": [
+          {
+            "CFBundleTypeName": "HTML document",
+            "CFBundleTypeRole": "Viewer",
+            "LSItemContentTypes": [
+              "public.html",
+              "public.xhtml"
+            ]
+          }
+        ],
+        "NSCameraUsageDescription": "Websites you visit may ask to use the camera.",
+        "NSMicrophoneUsageDescription": "Websites you visit may ask to use the microphone."
+      }
+    },
+    "protocols": [
+      {
+        "name": "Web site URL",
+        "schemes": [
+          "http",
+          "https"
+        ]
+      }
+    ]
+  }
+}

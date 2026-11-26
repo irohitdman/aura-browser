@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Page didn’t load</title>
+<link rel="stylesheet" href="common.css">
+<style>html,body{height:100%}body{display:grid;place-items:center}.box{max-width:460px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:12px;padding:32px}
+.box svg.i{width:28px;height:28px;color:var(--accent)}h1{margin:0;font-size:20px;font-weight:var(--wb)}p{margin:0;color:var(--mute);line-height:1.5}code{font:500 11.5px var(--mono);color:var(--mute)}.row{display:flex;gap:8px;margin-top:8px}</style></head>
+<body><div class="box" id="b"></div>
+<script src="common.js"></script>
+<script>
+const p = new URLSearchParams(location.search);
+const url = p.get('url') || '', code = Number(p.get('code')), desc = p.get('desc') || '';
+let host = url; try { host = new URL(url).hostname; } catch (e) {}
+const offline = [-106, -21, -130].includes(code) || !navigator.onLine;
+const title = offline ? 'You’re offline' : code === -105 ? 'Can’t find ' + host : code === -102 ? host + ' refused to connect' : /CERT|SSL/.test(desc) ? 'This connection isn’t private' : 'Page didn’t load';
+const body = offline ? 'Check your Wi‑Fi or network, then try again.' : code === -105 ? 'The address may be mistyped, or the site may be down.' : /CERT|SSL/.test(desc) ? 'The site’s certificate couldn’t be verified, so Aura stopped before sending anything.' : 'Something went wrong between Aura and the site.';
+$('#b').innerHTML = `${icon(offline ? 'globe' : 'info', 28)}<h1>${esc(title)}</h1><p>${esc(body)}</p><code>${esc(desc)} (${code})</code><div class="row"><button class="btn pri" id="retry">${icon('reload', 14)}Try again</button></div>`;
+document.title = title;
+$('#retry').onclick = () => { location.href = url; };
+addEventListener('online', () => { location.href = url; });
+</script></body></html>

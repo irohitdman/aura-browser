@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Downloads</title>
+<link rel="stylesheet" href="common.css"><link rel="stylesheet" href="list.css"></head>
+<body><div class="wrap">
+  <div class="top"><div><h1>Downloads</h1><p class="sub">Files go to your Downloads folder.</p></div><button class="btn" id="clear">Clear list</button></div>
+  <div id="list" style="display:flex;flex-direction:column;gap:8px"></div>
+</div>
+<script src="common.js"></script>
+<script>
+async function load() {
+  const rows = await A.call('dl:list');
+  if (!rows || !rows.length) { $('#list').innerHTML = `<div class="empty">${icon('download', 24)}<b>No downloads</b><span>Files you download show up here.</span></div>`; return; }
+  $('#list').innerHTML = rows.map(d => {
+    const pct = d.total ? Math.round(d.received / d.total * 100) : 0;
+    const live = d.state === 'progressing' || d.state === 'paused';
+    const gone = d.state === 'completed' && !d.exists;
+    const sub = live ? `${bytes(d.received)} of ${d.total ? bytes(d.total) : '?'}` : d.state === 'completed' ? (gone ? 'Moved or deleted' : bytes(d.total || d.received) + ' · ' + ago(d.ts)) : d.state === 'cancelled' ? 'Cancelled' : 'Failed';
+    let host = ''; try { host = new URL(d.url).hostname.replace(/^www\./, ''); } catch (e) {}
+    return `<div class="dl ${gone ? 'gone' : ''}"><span class="ic">${icon('download', 16)}</span><div style="min-width:0"><b class="trunc">${esc(d.name)}</b><small class="trunc">${esc(sub)}${host ? ' · ' + esc(host) : ''}</small>${live ? `<div class="bar"><i style="width:${pct}%"></i></div>` : ''}</div>
+      <div class="acts">${live ? `<button class="btn sm" data-a="dl:cancel" data-id="${d.id}">Cancel</button>` : d.state === 'completed' && !gone ? `<button class="btn sm" data-a="dl:open" data-id="${d.id}">Open</button><button class="btn sm" data-a="dl:show" data-id="${d.id}">Show in Finder</button>` : ''}<button class="btn sm" data-a="dl:remove" data-id="${d.id}" title="Remove from list">${icon('x', 13)}</button></div></div>`;
+  }).join('');
+}
+document.addEventListener('click', async (e) => {
+  const b = e.target.closest('[data-a]'); if (b) { await A.call(b.dataset.a, { id: b.dataset.id }); load(); }
+  if (e.target.closest('#clear')) { await A.call('dl:clear'); load(); }
+});
+A.on(w => { if (w === 'downloads') load(); });
+setInterval(load, 1000);
+load();
+</script></body></html>

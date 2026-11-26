@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>History</title>
+<link rel="stylesheet" href="common.css"><link rel="stylesheet" href="list.css"></head>
+<body><div class="wrap">
+  <div class="top"><div><h1>History</h1><p class="sub">Kept on this Mac only. Aura's Library is where saves live; this is just where you've been.</p></div>
+  <div style="display:flex;gap:6px"><button class="btn" id="clearHour">Clear last hour</button><button class="btn" id="clearAll">Clear all history</button></div></div>
+  <label class="q"><span class="ic" id="qic"></span><input id="q" placeholder="Search history" autofocus spellcheck="false"></label>
+  <div id="list"></div>
+</div>
+<script src="common.js"></script>
+<script>
+$('#qic').innerHTML = icon('search', 17);
+async function load() {
+  const rows = await A.call('hist:query', { q: $('#q').value, limit: 800 });
+  if (!rows || !rows.length) { $('#list').innerHTML = `<div class="empty">${icon('clock', 24)}<b>${$('#q').value ? 'Nothing found' : 'No history yet'}</b><span>${$('#q').value ? 'Try another word.' : 'Pages you visit show up here.'}</span></div>`; return; }
+  let h = '', day = '';
+  for (const v of rows) {
+    const d = new Date(v.ts);
+    const label = d.toDateString() === new Date().toDateString() ? 'Today' : d.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' });
+    if (label !== day) { day = label; h += `<div class="day lab">${esc(label)}</div>`; }
+    let host = ''; try { host = new URL(v.url).hostname.replace(/^www\./, ''); } catch (e) {}
+    h += `<a class="item" href="${esc(v.url)}" data-url="${esc(v.url)}"><span class="tm">${d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}</span><span class="fv">${icon('globe', 14)}</span><span class="tt trunc"><b class="trunc">${esc(v.title || v.url)}</b><span class="trunc">${esc(host)}</span></span><button class="x" data-del="${esc(v.url)}" title="Remove">${icon('x', 13)}</button></a>`;
+  }
+  $('#list').innerHTML = h;
+}
+let t; document.addEventListener('input', () => { clearTimeout(t); t = setTimeout(load, 120); });
+document.addEventListener('click', async (e) => {
+  const d = e.target.closest('[data-del]'); if (d) { e.preventDefault(); await A.call('hist:remove', { url: d.dataset.del }); return load(); }
+  const a = e.target.closest('a.item'); if (a && (e.metaKey || e.ctrlKey)) { e.preventDefault(); A.call('open', { url: a.dataset.url, newTab: true }); }
+  if (e.target.closest('#clearHour')) { await A.call('hist:clear', { since: 3600e3 }); load(); }
+  if (e.target.closest('#clearAll')) { if (confirm('Clear all history? Your Library and logins stay.')) { await A.call('hist:clear', {}); load(); } }
+});
+load();
+</script></body></html>
