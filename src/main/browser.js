@@ -6,12 +6,15 @@ const { uid, emptySpace, toUrl, SEARCH } = require('./state');
 const { tokens, SPACE_COLOURS, SPACE_ICONS } = require('./theme');
 const { READ_LOOK, PICK_TYPE, PICK_AREA, PICK_COLOUR } = require('./extract');
 const { lookToCss, KINDS } = require('./library');
+const { READ_TEXT, PRESETS } = require('./ai');
+const { storeId } = require('./webstore');
 
 const ROOT = path.join(__dirname, '..', '..');
 const SRC = path.join(__dirname, '..');
 const SIDEBAR_W = 252, STRIP_W = 56, BAR_H = 40, PANEL_W = 340, GAP = 10;
 const NEWTAB = 'aura://newtab/';
-const INTERNAL_TITLES = { newtab: 'Daily', library: 'Library', history: 'History', downloads: 'Downloads', settings: 'Settings', error: 'Page didn’t load' };
+const INTERNAL_TITLES = { newtab: 'Daily', library: 'Library', history: 'History', downloads: 'Downloads', settings: 'Settings', welcome: 'Welcome to Aura', error: 'Page didn’t load' };
+const ease = (t) => 1 - Math.pow(1 - t, 3);
 
 class Browser {
   constructor(ctx) {
@@ -19,7 +22,8 @@ class Browser {
     this.d = this.state.data;
     this.tabs = new Map();       // item id -> { view, space, loading, audible, look, find }
     this.sessions = new Map();   // space id -> session
-    this.rt = { overlay: false, revealSide: false, revealBar: false, flash: null, downloadsActive: 0, focusAddress: 0 };
+    this.rt = { overlay: false, revealSide: false, flash: null, downloadsActive: 0, focusAddress: 0 };
+    this.shown = null; // frame currently on screen, for animated changes
     this.pushTimer = null;
     this.win = null;
   }
@@ -35,12 +39,12 @@ class Browser {
   sessionFor(spaceId) {
     if (this.sessions.has(spaceId)) return this.sessions.get(spaceId);
     const ses = session.fromPartition('persist:space-' + spaceId);
-    this.setupSession(ses);
+    this.setupSession(ses, spaceId);
     this.sessions.set(spaceId, ses);
     return ses;
   }
 
-  setupSession(ses) {
+  setupSession(ses, spaceId) {
     ses.setUserAgent(app.userAgentFallback);
     this.protocolHandler(ses);
     ses.on('will-download', (_e, item) => {
@@ -64,11 +68,27 @@ class Browser {
       });
       this.flash({ icon: 'download', title: 'Downloading', text: rec.name, actions: [['Downloads', 'open:aura://downloads/']] }, 4000);
     });
-    // Extensions the person added in Settings (unpacked Chrome extensions).
-    for (const p of this.d.settings.extensions || []) {
+    // Extensions: from the Chrome Web Store or unpacked folders, each limited to the Spaces chosen for it.
+    for (const x of this.d.settings.extensions || []) if (this.extIn(x, spaceId)) this.loadExt(ses, x);
+  }
+  extIn(x, spaceId) { return x.on !== false && (x.spaces === 'all' || (Array.isArray(x.spaces) && x.spaces.includes(spaceId))); }
+  loadExt(ses, x) {
+    const api = ses.extensions || ses;
+    if (api.getAllExtensions().some(l => l.path === x.path)) return Promise.resolve();
+    return api.loadExtension(x.path, { allowFileAccess: true }).then(l => { if (l && l.id && !x.extId) { x.extId = l.id; this.state.save(); } }).catch(e => console.warn('extension failed', x.path, e.message));
+  }
+  // Re-apply which Spaces each extension runs in.
+  syncExtensions() {
+    for (const [spaceId, ses] of this.sessions) {
       const api = ses.extensions || ses;
-      api.loadExtension(p, { allowFileAccess: true }).catch(e => console.warn('extension failed', p, e.message));
+      for (const x of this.d.settings.extensions) {
+        const loaded = api.getAllExtensions().find(l => l.path === x.path);
+        if (this.extIn(x, spaceId) && !loaded) this.loadExt(ses, x);
+        if (!this.extIn(x, spaceId) && loaded) api.removeExtension(loaded.id);
+      }
+      for (const l of api.getAllExtensions()) if (!this.d.settings.extensions.some(x => x.path === l.path)) api.removeExtension(l.id);
     }
+    this.push();
   }
 
   protocolHandler(ses) {
@@ -79,16 +99,21 @@ class Browser {
       const p = decodeURIComponent(u.pathname);
       if (p === '/' || p === '') file = path.join(SRC, 'pages', (u.host === 'newtab' ? 'daily' : INTERNAL_TITLES[u.host] ? u.host : 'error') + '.html');
       else if (p.startsWith('/fonts/')) file = path.join(ROOT, 'assets', 'fonts', path.basename(p));
+      else if (p.startsWith('/daily-img/')) {
+        const name = path.basename(p);
+        if (!/^[a-z0-9-]+\.jpg$/i.test(name)) return new Response('no', { status: 404 });
+        file = path.join(this.daily.dir, name);
+      }
       else if (p.startsWith('/shot/')) {
         const [, , id, name] = p.split('/');
         if (!/^[a-z0-9]+$/i.test(id) || !/^(shot\.png|thumb\.jpg)$/.test(name)) return new Response('no', { status: 404 });
         file = this.library.file(id, name);
       } else file = path.join(SRC, 'pages', path.normalize(p).replace(/^([/\\])+/, ''));
-      if (!file.startsWith(SRC) && !file.startsWith(ROOT) && !file.startsWith(this.library.root)) return new Response('no', { status: 403 });
+      if (!file.startsWith(SRC) && !file.startsWith(ROOT) && !file.startsWith(this.library.root) && !file.startsWith(this.daily.dir)) return new Response('no', { status: 403 });
       try {
         const body = fs.readFileSync(file);
         const type = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.woff2': 'font/woff2', '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml', '.json': 'application/json' }[path.extname(file)] || 'application/octet-stream';
-        return new Response(body, { headers: { 'content-type': type, 'cache-control': 'no-cache' } });
+        return new Response(body, { headers: { 'content-type': type, 'cache-control': p.startsWith('/daily-img/') ? 'max-age=86400' : 'no-cache' } });
       } catch (e) {
         return new Response('Not found', { status: 404 });
       }
@@ -133,65 +158,143 @@ class Browser {
   }
 
   // Where the page sits. Panels push the page aside; nothing covers it at rest.
+  // The toolbar always shows. The sidebar can be full, icons, or hidden (point at the left edge).
   frame() {
     const [W, H] = this.win.getContentSize();
     const ui = this.d.ui;
-    const sideW = ui.sidebar === 'full' ? SIDEBAR_W : ui.sidebar === 'icons' ? STRIP_W : (this.rt.revealSide ? SIDEBAR_W : 0);
-    const barH = (ui.toolbar || this.rt.revealBar) ? BAR_H : 0;
+    const full = this.win.isFullScreen() && this.rt.htmlFull;
+    if (full) return { x: 0, y: 0, width: W, height: H, r: 0, sideW: 0, barH: 0, panelW: 0, W, H, panes: null };
+    const sideW = ui.sidebar === 'full' ? SIDEBAR_W : ui.sidebar === 'icons' ? STRIP_W : 0;
+    const barH = BAR_H;
     const panelW = ui.panel ? PANEL_W : 0;
-    const calm = sideW === 0 && barH === 0 && !panelW;
-    if (calm) return { x: 0, y: 0, width: W, height: H, r: 0, sideW, barH, panelW, W, H };
     const x = sideW ? sideW + 2 : GAP;
-    const y = barH || GAP;
-    return { x, y, width: Math.max(100, W - x - GAP - panelW), height: Math.max(100, H - y - GAP), r: 12, sideW, barH, panelW, W, H };
+    const y = barH;
+    const f = { x, y, width: Math.max(100, W - x - GAP - (panelW ? panelW : 0)), height: Math.max(100, H - y - GAP), r: 12, sideW, barH, panelW, W, H, panes: null };
+    const sp = this.split();
+    if (sp) {
+      const ratio = sp.ratio || 0.5;
+      const w1 = Math.round((f.width - 8) * ratio);
+      f.panes = [{ id: sp.a, x: f.x, y: f.y, width: w1, height: f.height }, { id: sp.b, x: f.x + w1 + 8, y: f.y, width: f.width - w1 - 8, height: f.height }];
+    }
+    return f;
   }
 
-  layout() {
+  // Split view: two tabs side by side. Lives on the Space; shows when either tab is the current one.
+  split(spaceId = this.d.active) {
+    const s = this.sp(spaceId).split;
+    if (!s) return null;
+    const cur = this.sp(spaceId).activeId;
+    if (!this.locate(s.a, spaceId) || !this.locate(s.b, spaceId)) { this.sp(spaceId).split = null; return null; }
+    return cur === s.a || cur === s.b ? s : null;
+  }
+  splitWith(otherId) {
+    const cur = this.current();
+    if (!cur) return;
+    if (!otherId) {
+      const sp = this.sp();
+      const other = [...sp.today, ...sp.pins].filter(i => i.id !== cur.id).sort((a, b) => b.ts - a.ts)[0];
+      otherId = other ? other.id : this.newTab({ background: true }).id;
+    }
+    if (otherId === cur.id) return;
+    this.ensureView(this.locate(otherId).item, this.d.active);
+    this.sp().split = { a: cur.id, b: otherId, ratio: 0.5 };
+    this.state.save();
+    this.layout(true);
+  }
+  unsplit() { this.sp().split = null; this.state.save(); this.layout(true); }
+  swapSplit() { const s = this.sp().split; if (s) { [s.a, s.b] = [s.b, s.a]; this.state.save(); this.layout(true); } }
+
+  layout(animate) {
     if (!this.win) return;
     const [W, H] = this.win.getContentSize();
     this.shell.setBounds({ x: 0, y: 0, width: W, height: H });
-    const f = this.frame();
-    const cur = this.current();
-    for (const [id, t] of this.tabs) {
-      const show = cur && id === cur.id && !this.rt.overlay;
-      t.view.setVisible(show);
-      // The page sits 1px inside the frame so its hairline edge stays visible.
-      const i = f.r ? 1 : 0;
-      if (show) { t.view.setBounds({ x: f.x + i, y: f.y + i, width: f.width - 2 * i, height: f.height - 2 * i }); t.view.setBorderRadius(Math.max(0, f.r - i)); }
+    const target = this.frame();
+    const from = this.shown;
+    clearInterval(this.animTimer);
+    const reduce = require('electron').systemPreferences.getAnimationSettings ? require('electron').systemPreferences.getAnimationSettings().prefersReducedMotion : false;
+    if (animate && from && !reduce && !this.rt.overlay && !!from.panes === !!target.panes) {
+      const t0 = Date.now(), dur = 200;
+      const lerp = (p, q, k) => Math.round(p + (q - p) * k);
+      const mix = (k) => {
+        const f = Object.assign({}, target, { x: lerp(from.x, target.x, k), y: lerp(from.y, target.y, k), width: lerp(from.width, target.width, k), height: lerp(from.height, target.height, k) });
+        if (target.panes) f.panes = target.panes.map((p, i) => ({ id: p.id, x: lerp(from.panes[i].x, p.x, k), y: lerp(from.panes[i].y, p.y, k), width: lerp(from.panes[i].width, p.width, k), height: lerp(from.panes[i].height, p.height, k) }));
+        return f;
+      };
+      this.place(mix(0));
+      this.push(true);
+      this.animTimer = setInterval(() => {
+        const k = Math.min(1, (Date.now() - t0) / dur);
+        const f = mix(ease(k));
+        this.place(f);
+        if (this.shell && !this.shell.webContents.isDestroyed()) this.shell.webContents.send('frame', f);
+        if (k >= 1) { clearInterval(this.animTimer); this.push(); }
+      }, 16);
+    } else {
+      this.place(target);
+      this.push();
     }
     if (process.platform === 'darwin') {
       const ui = this.d.ui;
-      const lightsVisible = ui.sidebar !== 'hidden' || this.rt.revealSide || ui.toolbar || this.rt.revealBar;
-      this.win.setWindowButtonVisibility(lightsVisible && !this.win.isFullScreen());
-      this.win.setWindowButtonPosition(ui.sidebar === 'icons' || (ui.sidebar === 'hidden' && !this.rt.revealSide) ? { x: (ui.sidebar === 'icons' ? STRIP_W : 0) + 14, y: 14 } : { x: 18, y: 14 });
+      this.win.setWindowButtonVisibility(!this.win.isFullScreen());
+      this.win.setWindowButtonPosition(ui.sidebar === 'full' ? { x: 18, y: 14 } : { x: 16, y: 14 });
     }
-    this.push();
   }
 
-  // Hide mode: point at the left edge for the sidebar, the top edge for the toolbar.
+  // Put the live views where the frame says.
+  place(f) {
+    this.shown = f;
+    const cur = this.current();
+    const i = f.r ? 1 : 0;
+    const rect = (b) => ({ x: b.x + i, y: b.y + i, width: Math.max(10, b.width - 2 * i), height: Math.max(10, b.height - 2 * i) });
+    for (const [id, t] of this.tabs) {
+      let box = null;
+      if (!this.rt.overlay && !this.rt.peek) {
+        if (f.panes) { const p = f.panes.find(x => x.id === id); if (p) box = p; }
+        else if (cur && id === cur.id) box = f;
+      }
+      t.view.setVisible(!!box);
+      if (box) { t.view.setBounds(rect(box)); t.view.setBorderRadius(Math.max(0, f.r - i)); }
+    }
+  }
+
+  // Hide mode: point at the left edge and the sidebar slides over the page.
   startEdgeWatch() {
     let leftAt = 0;
     this.edgeTimer = setInterval(() => {
       if (!this.win || !this.win.isFocused()) return;
       const ui = this.d.ui;
-      if (ui.sidebar !== 'hidden' && ui.toolbar) { if (this.rt.revealSide || this.rt.revealBar) { this.rt.revealSide = this.rt.revealBar = false; this.layout(); } return; }
+      if (ui.sidebar !== 'hidden') { if (this.rt.revealSide) { this.rt.revealSide = false; this.push(); } return; }
       const p = screen.getCursorScreenPoint();
       const b = this.win.getContentBounds();
       const inside = p.x >= b.x - 2 && p.x <= b.x + b.width && p.y >= b.y - 2 && p.y <= b.y + b.height;
       const x = p.x - b.x, y = p.y - b.y;
-      let side = this.rt.revealSide, bar = this.rt.revealBar;
-      if (ui.sidebar === 'hidden') {
-        if (inside && x <= 4) side = true;
-        else if (side && (x > SIDEBAR_W + 24 || !inside)) { if (!leftAt) leftAt = Date.now(); if (Date.now() - leftAt > 220) side = false; }
-        else leftAt = 0;
-      } else side = false;
-      if (!ui.toolbar) {
-        if (inside && y <= 4 && x > (side || ui.sidebar !== 'hidden' ? 0 : 0)) bar = true;
-        else if (bar && (y > BAR_H + 30 || !inside)) bar = false;
-      } else bar = false;
-      if (this.rt.overlay) return;
-      if (side !== this.rt.revealSide || bar !== this.rt.revealBar) { this.rt.revealSide = side; this.rt.revealBar = bar; this.layout(); }
+      let side = this.rt.revealSide;
+      if (inside && x <= 4 && y > BAR_H) side = true;
+      else if (side && (x > SIDEBAR_W + 24 || !inside)) { if (!leftAt) leftAt = Date.now(); if (Date.now() - leftAt > 220) side = false; }
+      else leftAt = 0;
+      if (this.rt.overlay && !side) return;
+      if (side !== this.rt.revealSide) {
+        this.rt.revealSide = side;
+        // The sidebar floats over the page while peeking, so the page never reflows.
+        this.peekView(side);
+        this.push(true);
+      }
     }, 70);
+  }
+  // While the sidebar peeks in hide mode, the page underneath is shown as a still so the shell can draw on top.
+  async peekView(on) {
+    if (on) {
+      const t = this.currentTab();
+      try { this.rt.peekStill = t ? (await t.view.webContents.capturePage()).toDataURL() : null; } catch (e) { this.rt.peekStill = null; }
+      if (!this.rt.revealSide) return;
+      this.rt.peek = true;
+      for (const [, x] of this.tabs) x.view.setVisible(false);
+      this.push(true);
+    } else {
+      this.rt.peek = false; this.rt.peekStill = null;
+      this.place(this.frame());
+      this.push(true);
+    }
   }
 
   // ---------- items: pins, folders, Today ----------
@@ -270,7 +373,7 @@ class Browser {
         if (internal) { it.title = INTERNAL_TITLES[internal[1]] || it.title; it.fav = null; }
         this.state.save();
       }
-      t.look = null; t.find = null;
+      t.look = null; t.find = null; t.ai = null;
       if (this.d.settings.keepHistory) this.history.add({ url, title: wc.getTitle(), space: t.space });
       this.push();
     };
@@ -279,6 +382,7 @@ class Browser {
     wc.on('did-finish-load', () => {
       const url = wc.getURL();
       if (/^(https?|file):/.test(url)) setTimeout(() => this.readLook(t).catch(() => {}), 700);
+      if (this.d.ui.panel === 'ask' && this.currentTab() === t) this.pageText(t).catch(() => {});
     });
     wc.on('did-fail-load', (_e, code, desc, url, isMain) => {
       if (!isMain || code === -3 || code === -27) return;
@@ -287,8 +391,13 @@ class Browser {
     wc.on('audio-state-changed', (e) => { t.audible = e.audible; this.push(); });
     wc.on('found-in-page', (_e, r) => { if (t.find) { t.find.matches = r.matches; t.find.active = r.activeMatchOrdinal; this.push(); } });
     wc.on('render-process-gone', () => { t.crashed = true; this.push(); });
-    wc.on('enter-html-full-screen', () => { this.rt.htmlFull = true; this.preFull = { ...this.d.ui }; this.d.ui.sidebar = 'hidden'; this.d.ui.toolbar = false; this.d.ui.panel = false; this.layout(); });
-    wc.on('leave-html-full-screen', () => { this.rt.htmlFull = false; if (this.preFull) Object.assign(this.d.ui, this.preFull); this.layout(); });
+    wc.on('enter-html-full-screen', () => { this.rt.htmlFull = true; setTimeout(() => this.layout(), 50); });
+    wc.on('leave-html-full-screen', () => { this.rt.htmlFull = false; setTimeout(() => this.layout(), 50); });
+    // In split view, clicking into the other pane makes it the current tab.
+    wc.on('focus', () => {
+      const s = this.split();
+      if (s && (s.a === t.id || s.b === t.id) && this.sp().activeId !== t.id) { this.sp().activeId = t.id; this.state.save(); this.push(); }
+    });
     wc.setWindowOpenHandler(({ url, disposition, features }) => {
       if (disposition === 'new-window' && features) {
         // Sign-in popups and the like keep their opener.
@@ -322,14 +431,17 @@ class Browser {
     const t = this.tabs.get(id);
     const wasCurrent = this.sp(l.space).activeId === id;
     if (t) { this.win.contentView.removeChildView(t.view); t.view.webContents.close(); this.tabs.delete(id); }
+    const spl = this.sp(l.space).split;
+    let partner = null;
+    if (spl && (spl.a === id || spl.b === id)) { this.sp(l.space).split = null; partner = spl.a === id ? spl.b : spl.a; }
     if (l.where === 'today') {
       l.list.splice(l.index, 1);
       if (!/^aura:\/\/newtab/.test(l.item.url)) { this.d.closed.unshift({ ...l.item, space: l.space }); this.d.closed.length = Math.min(this.d.closed.length, 30); }
     }
     if (wasCurrent) {
       const sp = this.sp(l.space);
-      let next = null;
-      if (l.where === 'today') next = sp.today[Math.min(l.index, sp.today.length - 1)];
+      let next = partner ? this.locate(partner, l.space) && this.locate(partner, l.space).item : null;
+      if (!next && l.where === 'today') next = sp.today[Math.min(l.index, sp.today.length - 1)];
       if (!next) next = [...sp.today].sort((a, b) => b.ts - a.ts)[0];
       if (!next) next = this.orderedItems(l.space).find(i => this.tabs.has(i.id));
       sp.activeId = null;
@@ -518,6 +630,8 @@ class Browser {
       { label: 'Move to folder', submenu: sp.folders.length ? sp.folders.map(f => ({ label: f.name, click: () => this.move(id, { where: 'folder', folderId: f.id }) })).concat([{ type: 'separator' }, { label: 'New folder…', click: () => { const f = this.folderCreate(); this.move(id, { where: 'folder', folderId: f.id }); } }]) : [{ label: 'New folder', click: () => { const f = this.folderCreate(); this.move(id, { where: 'folder', folderId: f.id }); } }] },
       { label: 'Move to Space', submenu: this.d.spaces.filter(s => s.id !== this.d.active).map(s => ({ label: s.name, click: () => this.moveToSpace(id, s.id) })) },
       { type: 'separator' },
+      { label: this.split() && (this.split().a === id || this.split().b === id) ? 'Close split view' : 'Open in split view', enabled: !!this.current() && (this.current().id !== id || !!this.split()), click: () => { const s = this.split(); if (s && (s.a === id || s.b === id)) this.unsplit(); else this.splitWith(id); } },
+      { type: 'separator' },
       { label: 'Copy address', click: () => clipboard.writeText(l.item.url) },
       { label: 'Duplicate', click: () => this.newTab({ url: l.item.url, after: id }) },
       { label: 'Reload', enabled: live, click: () => this.tabs.get(id) && this.tabs.get(id).view.webContents.reload() },
@@ -581,19 +695,22 @@ class Browser {
   async overlay(on) {
     if (on === this.rt.overlay) return;
     const t = this.currentTab();
-    if (on && t) {
-      try {
-        const img = await t.view.webContents.capturePage();
-        this.rt.still = img.toDataURL();
-      } catch (e) { this.rt.still = null; }
+    const f = this.shown || this.frame();
+    this.rt.stills = [];
+    if (on) {
+      const boxes = f.panes ? f.panes : (t ? [{ id: t.id, x: f.x, y: f.y, width: f.width, height: f.height }] : []);
+      for (const b of boxes) {
+        const x = this.tabs.get(b.id);
+        try { if (x) this.rt.stills.push({ x: b.x, y: b.y, width: b.width, height: b.height, src: (await x.view.webContents.capturePage()).toDataURL() }); } catch (e) {}
+      }
     }
-    if (!on) this.rt.still = null;
     this.rt.overlay = on;
     this.push(true);
     setTimeout(() => {
       this.layout();
       if (on) this.shell.webContents.focus(); else if (t) t.view.webContents.focus();
     }, on ? 30 : 0);
+    if (!on) this.rt.stills = [];
   }
 
   // ---------- state to the shell ----------
@@ -620,11 +737,15 @@ class Browser {
       pins: sp.pins.map(dec), folders: sp.folders.map(x => ({ id: x.id, name: x.name, open: x.open, items: x.items.map(dec) })), today: sp.today.map(dec),
       ui: this.d.ui, settings: { search: this.d.settings.search, searchName: (SEARCH[this.d.settings.search] || SEARCH.google).name },
       theme: this.theme(), frame: f, full: this.win && this.win.isFullScreen(),
-      rt: { overlay: this.rt.overlay, still: this.rt.overlay ? this.rt.still : null, revealSide: this.rt.revealSide, revealBar: this.rt.revealBar, flash: this.rt.flash, downloads: this.rt.downloadsActive, renameFolder: this.rt.renameFolder, focusDaily: this.rt.focusDaily },
+      rt: { overlay: this.rt.overlay, stills: this.rt.overlay ? this.rt.stills : [], peek: this.rt.peek, peekStill: this.rt.peek ? this.rt.peekStill : null, revealSide: this.rt.revealSide, flash: this.rt.flash, downloads: this.rt.downloadsActive, renameFolder: this.rt.renameFolder, focusDaily: this.rt.focusDaily, install: this.rt.install || null },
+      split: f && f.panes ? { a: f.panes[0].id, b: f.panes[1].id, active: cur && cur.id } : null,
+      ai: ct && ct.ai ? { turns: ct.ai.turns, busy: ct.ai.busy, words: ct.ai.words, article: ct.ai.article, needKey: ct.ai.needKey } : null, aiReady: this.ai.hasKey(),
+      exts: (this.d.settings.extensions || []).map(x => ({ path: x.path, name: x.name, icon: x.icon, on: x.on !== false, here: this.extIn(x, this.d.active), popup: !!x.popup, spaces: x.spaces, store: !!x.storeId })),
       page: cur ? {
         id: cur.id, url: wc ? wc.getURL() || cur.url : cur.url, title: cur.title,
         back: !!(wc && wc.navigationHistory.canGoBack()), fwd: !!(wc && wc.navigationHistory.canGoForward()),
-        loading: !!(ct && ct.loading), look: ct ? ct.look : null, find: ct ? ct.find : null,
+        loading: !!(ct && ct.loading), look: ct && ct.look ? (this.d.ui.panel === 'inspect' ? ct.look : Object.assign({}, ct.look, { svgs: [], images: [], vars: {} })) : null, find: ct ? ct.find : null,
+        store: wc ? storeId(wc.getURL()) : null, storeInstalled: wc && storeId(wc.getURL()) ? (this.d.settings.extensions || []).some(x => x.storeId === storeId(wc.getURL())) : false,
         zoom: wc ? Math.round(Math.pow(1.2, wc.getZoomLevel()) * 100) : 100, crashed: !!(ct && ct.crashed),
         secure: /^https:/.test(cur.url),
         savedLook: !!(wc && this.library.all().some(x => x.kind === 'look' && x.url === wc.getURL()))
@@ -640,8 +761,49 @@ class Browser {
     }
   }
 
+  // ---------- Aura Farming: ask about this page ----------
+  async pageText(t) {
+    const wc = t.view.webContents;
+    if (!/^https?:|^file:/.test(wc.getURL())) return null;
+    const r = await wc.executeJavaScript(READ_TEXT, false);
+    t.ai = t.ai || { turns: [], messages: [] };
+    t.ai.words = r.words; t.ai.article = r.article; t.ai.url = wc.getURL();
+    t.pageTextCache = r.text;
+    this.push();
+    return r;
+  }
+  async ask({ q, preset }) {
+    const t = this.currentTab();
+    if (!t) return;
+    if (this.d.ui.panel !== 'ask') { this.d.ui.panel = 'ask'; this.state.save(); this.layout(true); }
+    if (!this.ai.hasKey()) { t.ai = t.ai || { turns: [], messages: [] }; t.ai.needKey = true; this.push(); return; }
+    if (t.ai && t.ai.busy) return;
+    const wc = t.view.webContents;
+    if (!/^https?:|^file:/.test(wc.getURL())) { t.ai = { turns: [{ q: q || '', error: 'Open a website first, then ask about it.' }], messages: [] }; this.push(); return; }
+    if (!t.pageTextCache || !t.ai || t.ai.url !== wc.getURL()) await this.pageText(t).catch(() => {});
+    const ai = t.ai;
+    const label = preset ? { summary: 'Summarise in 3 bullets', takeaways: 'Key takeaways and actions', design: 'Describe the design', csv: 'Tables and data as CSV', faq: 'Generate an FAQ' }[preset] : q;
+    const turn = { q: label, text: '', busy: true };
+    ai.turns.push(turn); ai.busy = true; ai.needKey = false;
+    this.push();
+    const ctrl = new AbortController();
+    t.aiAbort = ctrl;
+    // Follow-ups reuse the conversation; the page goes in with the first question only.
+    const first = !ai.messages.length;
+    const res = first
+      ? await this.ai.ask({ question: q, preset, page: { url: wc.getURL(), title: wc.getTitle(), text: t.pageTextCache || '' }, look: t.look }, (piece) => { turn.text += piece; this.push(); }, ctrl.signal)
+      : await this.ai.ask({ question: q, preset, page: { url: wc.getURL(), title: wc.getTitle(), text: '(The page was shared earlier in this conversation.)' }, look: null, history: ai.messages }, (piece) => { turn.text += piece; this.push(); }, ctrl.signal);
+    turn.busy = false; ai.busy = false;
+    if (res.error === 'nokey') ai.needKey = true;
+    else if (res.error) turn.error = res.error;
+    if (res.messages) ai.messages = res.messages.slice(-12);
+    this.push();
+  }
+  stopAsk() { const t = this.currentTab(); if (t && t.aiAbort) t.aiAbort.abort(); }
+  clearAsk() { const t = this.currentTab(); if (t) { if (t.aiAbort) t.aiAbort.abort(); t.ai = { turns: [], messages: [], words: t.ai && t.ai.words, url: t.ai && t.ai.url }; this.push(); } }
+
   // ---------- command bar search ----------
-  commandResults(q) {
+  async commandResults(q) {
     const s = String(q || '').trim();
     const low = s.toLowerCase();
     const out = [];
@@ -649,6 +811,28 @@ class Browser {
       const url = toUrl(s, this.d.settings.search);
       const isSearch = url && url.startsWith((SEARCH[this.d.settings.search] || SEARCH.google).url.split('%s')[0]);
       out.push({ group: 'Go', kind: isSearch ? 'search' : 'url', title: isSearch ? s : url.replace(/^https?:\/\//, ''), sub: isSearch ? 'Search ' + (SEARCH[this.d.settings.search] || SEARCH.google).name : 'Open address', url });
+    }
+    // On this page: lines of the page that contain what was typed. Picking one finds it.
+    const ct = this.currentTab();
+    if (s.length >= 2 && ct && /^https?:|^file:/.test(ct.view.webContents.getURL())) {
+      try {
+        const hits = await Promise.race([ct.view.webContents.executeJavaScript(`(() => {
+          const q = ${JSON.stringify(low)}; const out = []; const seen = new Set();
+          const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+          let n, total = 0;
+          while ((n = w.nextNode()) && out.length < 4) {
+            const t = n.textContent; const i = t.toLowerCase().indexOf(q);
+            if (i < 0) continue;
+            const el = n.parentElement; if (!el || /^(SCRIPT|STYLE|NOSCRIPT)$/.test(el.tagName)) continue;
+            const r = el.getBoundingClientRect(); if (!r.width && !r.height) continue;
+            total++;
+            const a = Math.max(0, i - 40), snip = (a ? '…' : '') + t.slice(a, i + q.length + 60).replace(/\\s+/g, ' ').trim();
+            if (seen.has(snip)) continue; seen.add(snip); out.push(snip);
+          }
+          return out;
+        })()`, false), new Promise(r => setTimeout(() => r([]), 400))]);
+        (hits || []).forEach((h, i) => out.push({ group: 'On this page', kind: 'find', title: h, sub: i === 0 ? 'Find in page' : '', text: s, key: i === 0 ? '⌘F' : '' }));
+      } catch (e) {}
     }
     // Open tabs in this Space
     const tabs = this.orderedItems().filter(it => !low || (it.title || '').toLowerCase().includes(low) || (it.url || '').toLowerCase().includes(low)).slice(0, s ? 5 : 6);
@@ -661,10 +845,13 @@ class Browser {
     const cmds = [
       ['New tab', 'cmd:newtab', '⌘T'], ['Library', 'open:aura://library/', '⌘⇧O'], ['History', 'open:aura://history/', '⌘Y'], ['Downloads', 'open:aura://downloads/', '⌥⌘L'],
       ['Settings', 'open:aura://settings/', '⌘,'], ['Save whole view', 'save:page', '⌘S'], ['Save this look', 'save:look', '⌘⇧S'], ['Save a typeface', 'save:type', ''], ['Save a colour', 'save:colour', '⌘⇧C'], ['Save an area', 'save:area', '⌘⇧A'],
-      ['This page panel', 'cmd:panel', '⌘I'], ['Sidebar: always show', 'ui:sidebar:full', '⌘⇧1'], ['Sidebar: collapse to icons', 'ui:sidebar:icons', '⌘⇧2'], ['Sidebar: hide', 'ui:sidebar:hidden', '⌘⇧3'],
+      ['Inspect this page', 'cmd:inspect', '⌘I'], ['Ask about this page', 'cmd:ask', '⌘J'], ['Split view', 'cmd:split', '⌘⇧\\'], ['Extensions', 'cmd:extensions', ''], ['Import bookmarks and find my taste', 'open:aura://welcome/', ''], ['Sidebar: always show', 'ui:sidebar:full', '⌘⇧1'], ['Sidebar: collapse to icons', 'ui:sidebar:icons', '⌘⇧2'], ['Sidebar: hide', 'ui:sidebar:hidden', '⌘⇧3'],
       ['Light chrome', 'ui:theme:light', ''], ['Dark chrome', 'ui:theme:dark', ''], ['New Space', 'cmd:newspace', '⌘⇧N'], ['New folder', 'cmd:newfolder', ''], ['Make Aura the default browser', 'cmd:default', '']
     ].concat(this.d.spaces.map((sp, i) => ['Switch to ' + sp.name, 'space:' + sp.id, i < 4 ? '⌃' + (i + 1) : '']));
     cmds.filter(c => !low || c[0].toLowerCase().includes(low)).slice(0, s ? 4 : 0).forEach(c => out.push({ group: 'Commands', kind: 'cmd', title: c[0], action: c[1], key: c[2] }));
+    // Ask Aura about the page: ⌘⏎ from anywhere in the list.
+    if (s.length > 3 && ct && /^https?:/.test(ct.view.webContents.getURL())) out.push({ group: 'Ask Aura', kind: 'ask', title: s, sub: 'Ask about ' + (ct.view.webContents.getTitle() || 'this page').slice(0, 60), key: '⌘⏎' });
+    if (!s && ct && /^https?:/.test(ct.view.webContents.getURL())) [['summary', 'Summarise this page'], ['design', 'Describe the design of this page']].forEach(([p, t]) => out.push({ group: 'Ask Aura', kind: 'ask', preset: p, title: t, sub: this.ai.hasKey() ? 'Opens the Ask panel' : 'Add your Anthropic key in Settings first' }));
     return out;
   }
 }

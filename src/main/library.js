@@ -4,7 +4,7 @@ const path = require('path');
 const { JsonStore, dir } = require('./store');
 const { uid } = require('./state');
 
-const KINDS = { page: 'Pages', look: 'Looks', type: 'Typefaces', colour: 'Colours', area: 'Areas' };
+const KINDS = { page: 'Pages', look: 'Looks', type: 'Typefaces', colour: 'Colours', area: 'Areas', taste: 'Taste' };
 
 const HUES = [
   [0, 'red'], [20, 'orange'], [45, 'yellow'], [70, 'lime'], [140, 'green'], [170, 'teal'], [188, 'cyan'],

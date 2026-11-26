@@ -1,6 +1,6 @@
 {
   "name": "aura-browser",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Aura, a browser for designers",
   "main": "src/main/main.js",
   "scripts": {
@@ -70,5 +70,8 @@
         ]
       }
     ]
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.14.0"
   }
 }

@@ -17,6 +17,10 @@ const { Library, lookToCss } = require('./library');
 const { History, Downloads, Passwords } = require('./records');
 const { Browser, NEWTAB } = require('./browser');
 const { tokens, SPACE_COLOURS, SPACE_ICONS } = require('./theme');
+const { AI } = require('./ai');
+const { Daily } = require('./feeds');
+const taste = require('./taste');
+const webstore = require('./webstore');
 
 let B = null;
 const pending = [];
@@ -39,16 +43,30 @@ app.on('open-file', (e, file) => {
 
 app.whenReady().then(() => {
   const state = openState();
-  B = new Browser({ state, library: new Library(), history: new History(), downloads: new Downloads(), passwords: new Passwords() });
+  migrate(state.data);
+  const daily = new Daily();
+  B = new Browser({ state, library: new Library(), history: new History(), downloads: new Downloads(), passwords: new Passwords(), ai: new AI(), daily });
+  daily.onChange = () => B.broadcastInternal('daily');
   B.protocolHandler(session.defaultSession);
   buildMenu();
   wireIpc();
   B.open();
   pending.splice(0).forEach(u => B.newTab({ url: u }));
+  // First run: bring bookmarks over and find a taste. Skippable, and never shown again once done or skipped.
+  if (!B.d.settings.onboarded && !process.env.AURA_DRIVE) B.navigate('aura://welcome/');
+  setTimeout(() => daily.refresh().catch(() => {}), 1500);
+  setInterval(() => daily.refresh().catch(() => {}), 60 * 60 * 1000);
   if (process.env.AURA_DRIVE) startDriver(process.env.AURA_DRIVE);
   nativeTheme.on('updated', () => { if (B.d.ui.theme === 'system') { B.push(); B.broadcastInternal('theme'); } });
   app.on('activate', () => { if (!B.win) B.open(); });
 });
+
+// Older saved state: extensions were plain folder paths, the panel was on or off.
+function migrate(d) {
+  d.settings.extensions = (d.settings.extensions || []).map(x => typeof x === 'string' ? { path: x, name: path.basename(x), spaces: 'all', on: true } : x);
+  if (d.ui.panel === true) d.ui.panel = 'inspect';
+  d.ui.toolbar = true;
+}
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('before-quit', () => { if (B) B.state.save(true); });
@@ -102,13 +120,14 @@ function buildMenu() {
       { label: 'Library', accelerator: 'CmdOrCtrl+Shift+O', click: go(() => openInternal('library')) }
     ] },
     { label: 'View', submenu: [
-      { label: 'This page panel', accelerator: 'CmdOrCtrl+I', click: go(() => { B.d.ui.panel = !B.d.ui.panel; B.state.save(); B.layout(); }) },
+      { label: 'Inspect this page', accelerator: 'CmdOrCtrl+I', click: go(() => togglePanel('inspect')) },
+      { label: 'Ask about this page', accelerator: 'CmdOrCtrl+J', click: go(() => togglePanel('ask')) },
+      { label: 'Split view', accelerator: 'CmdOrCtrl+Shift+\\', click: go(() => B.split() ? B.unsplit() : B.splitWith()) },
       { type: 'separator' },
       { label: 'Sidebar: always show', accelerator: 'CmdOrCtrl+Shift+1', click: go(() => setUi({ sidebar: 'full' })) },
       { label: 'Sidebar: collapse to icons', accelerator: 'CmdOrCtrl+Shift+2', click: go(() => setUi({ sidebar: 'icons' })) },
       { label: 'Sidebar: hide', accelerator: 'CmdOrCtrl+Shift+3', click: go(() => setUi({ sidebar: 'hidden' })) },
       { label: 'Toggle sidebar', accelerator: 'CmdOrCtrl+\\', click: go(() => setUi({ sidebar: B.d.ui.sidebar === 'full' ? 'hidden' : 'full' })) },
-      { label: 'Keep the toolbar showing', accelerator: 'CmdOrCtrl+Shift+L', click: go(() => setUi({ toolbar: !B.d.ui.toolbar })) },
       { type: 'separator' },
       { label: 'Reload', accelerator: 'CmdOrCtrl+R', click: go(() => wc() && wc().reload()) },
       { label: 'Hard Reload', accelerator: 'CmdOrCtrl+Shift+R', click: go(() => wc() && wc().reloadIgnoringCache()) },
@@ -149,7 +168,14 @@ function buildMenu() {
 }
 
 function shellCmd(cmd, arg) { if (B && B.shell) { B.shell.webContents.focus(); B.shell.webContents.send('cmd', cmd, arg); } }
-function setUi(patch) { Object.assign(B.d.ui, patch); B.state.save(); B.layout(); }
+function setUi(patch) { Object.assign(B.d.ui, patch); B.state.save(); B.layout(true); }
+function togglePanel(kind) {
+  B.d.ui.panel = B.d.ui.panel === kind ? false : kind;
+  B.state.save(); B.layout(true);
+  const t = B.currentTab();
+  if (kind === 'ask' && B.d.ui.panel === 'ask' && t) B.pageText(t).catch(() => {});
+  if (kind === 'inspect' && B.d.ui.panel === 'inspect' && t) B.readLook(t).catch(() => {});
+}
 function zoom(d) { const w = B.wc(); if (w) { w.setZoomLevel(Math.max(-5, Math.min(5, w.getZoomLevel() + d))); B.push(); } }
 function cycle(d) {
   const list = B.orderedItems(); const c = B.current();
@@ -233,7 +259,34 @@ function wireIpc() {
         ]).popup({ window: B.win });
         return;
       }
-      case 'ui': Object.assign(B.d.ui, a); B.state.save(); B.layout(); if (a.theme) B.broadcastInternal('theme'); return;
+      case 'ui': {
+        if (a.panel !== undefined) { togglePanel(a.panel || B.d.ui.panel); delete a.panel; }
+        if (Object.keys(a).length) { Object.assign(B.d.ui, a); B.state.save(); B.layout(a.sidebar !== undefined); if (a.theme) B.broadcastInternal('theme'); }
+        return;
+      }
+      case 'ask': return B.ask(a);
+      case 'askStop': return B.stopAsk();
+      case 'askClear': return B.clearAsk();
+      case 'split': return a.id ? B.splitWith(a.id) : (B.split() ? B.unsplit() : B.splitWith());
+      case 'unsplit': return B.unsplit();
+      case 'swapSplit': return B.swapSplit();
+      case 'extOpen': return extOpen(a.path);
+      case 'extMenu': return extMenu(a.path);
+      case 'storeFetch': {
+        const id = webstore.storeId(B.wc() && B.wc().getURL());
+        if (!id) return { error: 'Open an extension’s page in the Chrome Web Store first.' };
+        try { B.rt.install = Object.assign({ storeId: id }, await webstore.fetchExtension(id)); B.push(); return B.rt.install; }
+        catch (e) { return { error: 'Couldn’t download it: ' + e.message }; }
+      }
+      case 'storeInstall': {
+        const x = B.rt.install; if (!x) return;
+        const rec = { path: x.path, name: x.name, version: x.version, icon: x.icon, popup: x.popup, storeId: x.storeId, spaces: a.spaces === 'all' ? 'all' : [B.d.active], on: true };
+        B.d.settings.extensions = B.d.settings.extensions.filter(e => e.storeId !== x.storeId && e.path !== x.path).concat([rec]);
+        B.state.save(); B.rt.install = null; B.syncExtensions(); broadcastExt();
+        B.flash({ icon: 'check', title: x.name + ' added', text: rec.spaces === 'all' ? 'In every Space' : 'In ' + B.space().name + ' only', saved: true }, 5000);
+        return true;
+      }
+      case 'storeCancel': B.rt.install = null; B.push(); return;
       case 'overlay': return B.overlay(!!a.on);
       case 'find': {
         const t = B.currentTab(); if (!t) return;
@@ -249,6 +302,7 @@ function wireIpc() {
       case 'copy': clipboard.writeText(String(a.text || '')); return true;
       case 'copyCss': { const t = B.currentTab(); if (t && t.look) { clipboard.writeText(lookToCss(t.look)); B.flash({ icon: 'check', title: 'Copied as CSS', text: (t.look.colours || []).length + ' colours, ' + (t.look.faces || []).length + ' faces' }, 3000); } return; }
       case 'commands': return B.commandResults(a.q);
+      case 'findText': { const t = B.currentTab(); if (t) { t.find = { text: a.text, matches: 0, active: 0 }; t.view.webContents.findInPage(a.text); B.push(); } return; }
       case 'run': return runAction(a.action);
       case 'focusPage': { const t = B.currentTab(); if (t) t.view.webContents.focus(); return; }
       case 'unflash': return B.unflash();
@@ -335,27 +389,100 @@ function wireIpc() {
         const r = await dialog.showOpenDialog(B.win, { properties: ['openDirectory'], message: 'Choose an unpacked Chrome extension folder (it has a manifest.json)' });
         if (r.canceled || !r.filePaths[0]) return null;
         const p = r.filePaths[0];
-        if (!fs.existsSync(path.join(p, 'manifest.json'))) return { error: 'That folder has no manifest.json.' };
-        if (!B.d.settings.extensions.includes(p)) B.d.settings.extensions.push(p);
-        B.state.save();
-        for (const ses of B.sessions.values()) { const api = ses.extensions || ses; await api.loadExtension(p, { allowFileAccess: true }).catch(() => {}); }
+        let manifest;
+        try { manifest = JSON.parse(fs.readFileSync(path.join(p, 'manifest.json'), 'utf8')); } catch (e) { return { error: 'That folder has no readable manifest.json.' }; }
+        if (!B.d.settings.extensions.some(x => x.path === p)) {
+          const icon = webstore.iconOf(p, manifest);
+          let iconData = null; try { if (icon) iconData = 'data:image/png;base64,' + fs.readFileSync(icon).toString('base64'); } catch (e) {}
+          B.d.settings.extensions.push({ path: p, name: webstore.localised(p, manifest, manifest.name), version: manifest.version, icon: iconData, popup: (manifest.action || manifest.browser_action || {}).default_popup || null, spaces: 'all', on: true });
+        }
+        B.state.save(); B.syncExtensions();
         return { ok: true };
       }
-      case 'ext:list': {
-        const ses = B.sessionFor(B.d.active); const api = ses.extensions || ses;
-        const loaded = api.getAllExtensions();
-        return B.d.settings.extensions.map(p => { const x = loaded.find(l => l.path === p); return { path: p, name: x ? x.name : path.basename(p), version: x ? x.version : '', loaded: !!x }; });
+      case 'ext:list': return B.d.settings.extensions.map(x => ({ path: x.path, name: x.name, version: x.version, icon: x.icon, spaces: x.spaces, on: x.on !== false, store: x.storeId || null }));
+      case 'ext:update': {
+        const x = B.d.settings.extensions.find(e => e.path === a.path); if (!x) return false;
+        if (a.on !== undefined) x.on = !!a.on;
+        if (a.spaces !== undefined) x.spaces = a.spaces === 'all' ? 'all' : (Array.isArray(a.spaces) ? a.spaces.filter(id => B.space(id)) : x.spaces);
+        B.state.save(); B.syncExtensions(); return true;
       }
       case 'ext:remove': {
-        B.d.settings.extensions = B.d.settings.extensions.filter(p => p !== a.path); B.state.save();
-        for (const ses of B.sessions.values()) { const api = ses.extensions || ses; const x = api.getAllExtensions().find(l => l.path === a.path); if (x) api.removeExtension(x.id); }
+        const x = B.d.settings.extensions.find(e => e.path === a.path);
+        B.d.settings.extensions = B.d.settings.extensions.filter(e => e.path !== a.path); B.state.save(); B.syncExtensions();
+        if (x && x.storeId && x.path.startsWith(app.getPath('userData'))) fs.rm(x.path, { recursive: true, force: true }, () => {});
         return true;
       }
+      // Daily
+      case 'daily:get': return B.daily.get();
+      case 'daily:refresh': return B.daily.refresh(true);
+      // Aura Farming settings
+      case 'ai:get': return B.ai.settings();
+      case 'ai:set': B.ai.set(a); B.push(); return B.ai.settings();
+      case 'ai:key': { const ok = B.ai.setKey(a.key); B.push(); return ok ? B.ai.settings() : { error: 'This Mac can’t store keys securely right now.' }; }
+      // Onboarding
+      case 'taste:sources': return taste.sources();
+      case 'taste:load': {
+        let text = null;
+        const src = a.src;
+        if (src.browser === 'file') {
+          const r = await dialog.showOpenDialog(B.win, { properties: ['openFile'], filters: [{ name: 'Bookmarks', extensions: ['html', 'htm'] }], message: 'Choose a bookmarks file exported from Safari, Firefox or another browser' });
+          if (r.canceled || !r.filePaths[0]) return null;
+          text = fs.readFileSync(r.filePaths[0], 'utf8');
+        } else if (!taste.sources().some(x => x.id === src.id)) return null;
+        const list = taste.load(src.browser === 'file' ? src : taste.sources().find(x => x.id === src.id), text);
+        tasteSession.bookmarks = list;
+        return { count: list.length, folders: [...new Set(list.map(b => b.folder).filter(Boolean))].length, candidates: taste.candidates(list) };
+      }
+      case 'taste:import': {
+        const list = tasteSession.bookmarks || [];
+        if (!list.length) return 0;
+        const sp = B.sp(a.spaceId && B.space(a.spaceId) ? a.spaceId : B.d.active);
+        const groups = new Map();
+        for (const b of list.slice(0, 600)) { const k = b.folder || a.name || 'Bookmarks'; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(b); }
+        for (const [name, items] of groups) sp.folders.push({ id: uid('f'), name: name.slice(0, 60), open: false, items: items.map(b => ({ id: uid('t'), url: b.url, title: b.title, fav: null, ts: 0 })) });
+        B.state.save(); B.push();
+        return Math.min(list.length, 600);
+      }
+      case 'taste:visit': {
+        const sender = e.sender;
+        tasteSession.stop = { stopped: false };
+        const sites = (a.sites || []).slice(0, 30).filter(x => /^https?:/.test(x.url));
+        tasteSession.results = await taste.visit(sites, (r, n) => { if (!sender.isDestroyed()) sender.send('aura:changed', 'taste', { n, of: sites.length, site: { host: r.host, url: r.url, title: r.title, thumb: r.thumb, error: r.error, look: r.look ? { colours: r.look.colours, faces: r.look.faces, dark: r.look.dark, values: r.look.values } : null } }); }, tasteSession.stop);
+        return tasteSession.results.length;
+      }
+      case 'taste:stop': if (tasteSession.stop) tasteSession.stop.stopped = true; return;
+      case 'taste:compose': return taste.compose(tasteSession.results || [], a.answers || {}, a.words || []);
+      case 'taste:save': {
+        const t = [...B.tabs.values()].find(x => x.view.webContents === e.sender);
+        const r = a.result;
+        let image = null;
+        if (t && a.rect) { try { image = await e.sender.capturePage({ x: Math.round(a.rect.x), y: Math.round(a.rect.y), width: Math.round(a.rect.width), height: Math.round(a.rect.height) }); } catch (err) {} }
+        const look = { colours: r.palette.map(c => ({ hex: c.hex, role: c.role, from: c.from })), faces: r.type.map(f => ({ family: f.family, stack: f.stack, role: (f.roles[0] || 'Body'), weight: '', size: '', licence: (f.from || []).join(', '), from: f.from })), values: { radius: r.radius, measure: '', words: (r.words || []).join(', '), motion: r.motion }, dark: r.lean === 'Dark' };
+        const rec = B.library.add({ kind: 'taste', title: 'My taste, ' + new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }), host: 'aura', url: 'aura://welcome/', look, taste: r, spaceId: B.d.active, spaceName: B.space().name }, image);
+        B.d.settings.onboarded = true; B.d.settings.taste = rec.id; B.state.save();
+        B.broadcastInternal('library'); B.push();
+        return rec.id;
+      }
+      case 'onboarded': B.d.settings.onboarded = true; B.state.save(); return true;
       case 'clear-site-data': {
         for (const s of B.d.spaces) await B.sessionFor(s.id).clearStorageData();
         return true;
       }
     }
+  });
+
+  // Web pages: Explain, Summarise and Translate on selected text. Only from a real click, only from a tab.
+  ipcMain.handle('web:ai', async (e, a) => {
+    const t = [...B.tabs.values()].find(x => x.view.webContents === e.sender);
+    if (!t || !a || !['explain', 'summarize', 'translate'].includes(a.action)) return { error: 'Not available here.' };
+    if (!B.ai.hasKey()) return { error: 'nokey' };
+    const res = await B.ai.ask({ action: a.action, selection: String(a.text || '').slice(0, 12000) }, (piece) => { if (!e.sender.isDestroyed()) e.sender.send('web:ai-chunk', a.n, piece); });
+    return { text: res.text, error: res.error, model: B.ai.d.model };
+  });
+  ipcMain.handle('web:ai-ready', () => ({ ready: B.ai.hasKey() && B.ai.d.readSelection, lang: B.ai.d.lang }));
+  ipcMain.on('web:ai-panel', (e, a) => {
+    const t = [...B.tabs.values()].find(x => x.view.webContents === e.sender);
+    if (t && B.currentTab() === t) B.ask({ q: 'About this passage: "' + String(a.text || '').slice(0, 2000) + '". ' + (a.q || 'Explain it in more depth.') });
   });
 
   // Web pages: only the password bridge, keyed by the frame's real origin.
@@ -373,6 +500,37 @@ function wireIpc() {
   });
 }
 
+const tasteSession = {};
+
+// Extensions: open the extension's own popup page in a small window under the toolbar.
+function extOpen(p) {
+  const x = B.d.settings.extensions.find(e => e.path === p);
+  if (!x) return;
+  const ses = B.sessionFor(B.d.active);
+  const api = ses.extensions || ses;
+  const loaded = api.getAllExtensions().find(l => l.path === p);
+  if (!loaded) return B.flash({ icon: 'info', title: x.name + ' is off in this Space', text: 'Turn it on in Settings › Extensions.' }, 4000);
+  if (!x.popup) return B.flash({ icon: 'info', title: x.name + ' works on the page', text: 'It has no menu of its own.' }, 3500);
+  const { BrowserWindow } = require('electron');
+  const b = B.win.getContentBounds();
+  const pop = new BrowserWindow({ parent: B.win, x: b.x + b.width - 400, y: b.y + 44, width: 380, height: 520, frame: false, resizable: false, show: false, roundedCorners: true, backgroundColor: '#FFFFFF', webPreferences: { session: ses, sandbox: true, contextIsolation: true } });
+  pop.loadURL(`chrome-extension://${loaded.id}/${x.popup.replace(/^\//, '')}`).catch(() => {});
+  pop.once('ready-to-show', () => pop.show());
+  pop.on('blur', () => { if (!pop.isDestroyed()) pop.close(); });
+}
+function extMenu(p) {
+  const x = B.d.settings.extensions.find(e => e.path === p);
+  if (!x) return;
+  Menu.buildFromTemplate([
+    { label: x.on === false ? 'Turn on' : 'Turn off', click: () => { x.on = x.on === false; B.state.save(); B.syncExtensions(); broadcastExt(); } },
+    { label: 'Run in', submenu: [{ label: 'All Spaces', type: 'radio', checked: x.spaces === 'all', click: () => { x.spaces = 'all'; B.state.save(); B.syncExtensions(); broadcastExt(); } }].concat(B.d.spaces.map(sp => ({ label: sp.name + ' only', type: 'radio', checked: Array.isArray(x.spaces) && x.spaces.length === 1 && x.spaces[0] === sp.id, click: () => { x.spaces = [sp.id]; B.state.save(); B.syncExtensions(); broadcastExt(); } }))) },
+    { type: 'separator' },
+    { label: 'Manage extensions…', click: () => openInternal('settings', '#extensions') },
+    { label: 'Remove ' + x.name, click: () => { B.d.settings.extensions = B.d.settings.extensions.filter(e => e !== x); B.state.save(); B.syncExtensions(); broadcastExt(); } }
+  ]).popup({ window: B.win });
+}
+function broadcastExt() { B.broadcastInternal('extensions'); B.push(); }
+
 function runAction(action) {
   if (!action) return;
   const [k, ...rest] = action.split(':');
@@ -386,7 +544,10 @@ function runAction(action) {
   if (k === 'dl-open') { const d = B.downloads.list().find(x => x.id === v); if (d) shell.openPath(d.path); return; }
   if (k === 'cmd') {
     if (v === 'newtab') return B.newTab();
-    if (v === 'panel') { B.d.ui.panel = !B.d.ui.panel; B.state.save(); return B.layout(); }
+    if (v === 'panel' || v === 'inspect') return togglePanel('inspect');
+    if (v === 'ask') return togglePanel('ask');
+    if (v === 'split') return B.split() ? B.unsplit() : B.splitWith();
+    if (v === 'extensions') return shellCmd('extensions');
     if (v === 'newfolder') return B.folderCreate();
     if (v === 'default') return makeDefault();
     if (v === 'newspace' || v === 'cmd') return shellCmd(v);

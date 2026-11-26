@@ -7,10 +7,11 @@
 <link rel="stylesheet" href="shell.css">
 </head>
 <body>
-  <div id="frame"><div id="still"></div><div id="shade"></div></div>
+  <div id="frames"></div>
+  <div id="shade"></div>
 
   <aside id="side" aria-label="Sidebar">
-    <div class="stop drag"><button class="sbk nodrag" id="sbBtn" title="Sidebar and toolbar" data-act="smenu"></button></div>
+    <div class="stop drag"><div class="brand" id="brand"></div><button class="sbk nodrag" id="sbBtn" title="Sidebar" data-act="smenu"></button></div>
     <div class="pins" id="pins"></div>
     <div class="scroll" id="scroll"></div>
     <div class="sbar" id="sbar"></div>
@@ -23,10 +24,13 @@
   <div class="pop" id="saveMenu" role="menu"></div>
   <div class="pop" id="smenu" role="menu"></div>
   <div class="pop" id="nmenu" role="menu"></div>
-  <div class="pop" id="spaceEd" role="dialog" aria-label="Space"></div>
+  <div class="pop" id="exts" role="dialog" aria-label="Extensions"></div>
+  <div class="pop modal" id="spaceEd" role="dialog" aria-label="Space"></div>
+  <div class="pop modal" id="install" role="dialog" aria-label="Add extension"></div>
   <div class="pop" id="cmd" role="dialog" aria-label="Command bar">
     <div class="q"><span class="ic" id="cmdIc"></span><input id="cmdIn" placeholder="Search, enter an address, or describe a save" autocomplete="off" spellcheck="false"><kbd>esc</kbd></div>
     <div class="res-list" id="cmdRes"></div>
+    <div class="cmdft" id="cmdFt"></div>
   </div>
 
   <script src="icons.js"></script>

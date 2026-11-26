@@ -14,6 +14,11 @@ const READ_LOOK = `(() => {
   const bg = new Map(), fg = new Map(), accents = new Map(), fonts = new Map(), radii = new Map();
   const bump = (m, k, v) => { if (k) m.set(k, (m.get(k) || 0) + v); };
   let measure = 0, canvases = 0, webgl = false, videos = 0, anims = 0;
+  const sizes = new Map(), images = [], seenImg = new Set(), svgs = [], grads = [];
+  const addImg = (src, w, h, alt) => {
+    if (!src || seenImg.has(src) || images.length >= 16 || /^data:image\\/(gif|svg)/.test(src) && src.length < 200) return;
+    seenImg.add(src); images.push({ src: src.slice(0, 2000), w: Math.round(w), h: Math.round(h), alt: (alt || '').slice(0, 80) });
+  };
 
   // Page background first: html, then body.
   const rootBg = toHex(getComputedStyle(document.documentElement).backgroundColor) || toHex(getComputedStyle(document.body || document.documentElement).backgroundColor) || '#FFFFFF';
@@ -33,6 +38,16 @@ const READ_LOOK = `(() => {
     const tag = el.tagName;
     if (tag === 'CANVAS') { canvases++; try { if (el.getContext && (el.getContext('webgl2') || el.getContext('webgl'))) webgl = true; } catch (e) {} }
     if (tag === 'VIDEO') videos++;
+    if (tag === 'IMG' && r.width >= 48 && r.height >= 48) addImg(el.currentSrc || el.src, el.naturalWidth || r.width, el.naturalHeight || r.height, el.alt);
+    if (cs.backgroundImage && cs.backgroundImage !== 'none') {
+      const m = cs.backgroundImage.match(/url\\(["']?([^"')]+)["']?\\)/);
+      if (m && r.width >= 80 && r.height >= 60) addImg(new URL(m[1], location.href).href, r.width, r.height, '');
+      if (/gradient\\(/.test(cs.backgroundImage) && grads.length < 4 && area > 4000) grads.push(cs.backgroundImage.slice(0, 300));
+    }
+    if (tag === 'svg' && svgs.length < 10 && r.width >= 14 && r.width <= 320 && r.height <= 200) {
+      const html = el.outerHTML;
+      if (html.length < 8000 && !svgs.some(x => x.html === html)) svgs.push({ html, w: Math.round(r.width), h: Math.round(r.height) });
+    }
     if (cs.animationName && cs.animationName !== 'none') anims++;
     const rad = parseFloat(cs.borderTopLeftRadius);
     if (rad > 0 && rad < 200 && area > 400) bump(radii, Math.round(rad), 1);
@@ -50,6 +65,7 @@ const READ_LOOK = `(() => {
       const fam = cs.fontFamily.split(',')[0].replace(/["']/g, '').trim();
       const size = Math.round(parseFloat(cs.fontSize) * 2) / 2;
       const weight = cs.fontWeight;
+      bump(sizes, size, len);
       const key = fam;
       const f = fonts.get(key) || { family: fam, stack: cs.fontFamily, chars: 0, uses: {} };
       f.chars += len * (size / 14);
@@ -112,6 +128,9 @@ const READ_LOOK = `(() => {
     url: location.href, host: location.hostname.replace(/^www\\./, ''), title: document.title,
     description: meta('description') || meta('og:description'),
     colours, faces, vars,
+    scale: [...sizes.entries()].filter(e => e[1] > 6).map(e => e[0]).sort((a, b) => b - a).slice(0, 9),
+    images, svgs, gradients: grads,
+    lineHeight: (() => { try { const p = document.querySelector('p'); if (!p) return ''; const cs = getComputedStyle(p); return (parseFloat(cs.lineHeight) / parseFloat(cs.fontSize)).toFixed(2); } catch (e) { return ''; } })(),
     values: { radius: rs.length ? rs.join('/') + 'px' : '0', measure: measure ? measure + 'px' : 'Fluid', motion },
     dark: light(colours[0] ? colours[0].hex : '#FFFFFF') < 0.45
   };

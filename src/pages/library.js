@@ -1,7 +1,7 @@
 // Library: every save, found by describing it.
 /* global A, esc, icon, $, ago */
-const KINDS = [['all', 'All saves'], ['look', 'Looks'], ['page', 'Pages'], ['type', 'Typefaces'], ['colour', 'Colours'], ['area', 'Areas']];
-const KIND_ONE = { page: 'Page', look: 'Look', type: 'Typeface', colour: 'Colour', area: 'Area' };
+const KINDS = [['all', 'All saves'], ['look', 'Looks'], ['page', 'Pages'], ['type', 'Typefaces'], ['colour', 'Colours'], ['area', 'Areas'], ['taste', 'Taste']];
+const KIND_ONE = { page: 'Page', look: 'Look', type: 'Typeface', colour: 'Colour', area: 'Area', taste: 'Taste palette' };
 let kind = 'all', space = '', sel = location.hash.slice(1) || null, data = { saves: [], counts: {}, spaces: [] };
 let seq = 0;
 $('#qic').innerHTML = icon('search', 18);
@@ -32,7 +32,7 @@ function draw() {
       ? `<div class="empty" style="grid-column:1/-1">${icon('search', 24)}<b>Nothing matches</b><span>Try fewer words, or describe the colour, the type or the site.</span></div>`
       : `<div class="empty" style="grid-column:1/-1">${icon('camera', 24)}<b>Your Library is empty</b><span>Press ⌘S on any site to save the whole view. ⌘⇧S saves its look: colours, type and values. Everything stays on this Mac.</span></div>`;
   } else {
-    $('#grid').innerHTML = data.saves.map(s => `<button class="card ${sel === s.id ? 'on' : ''}" data-id="${s.id}">${thumb(s)}<span class="m"><b class="trunc">${esc(s.title || s.host)}</b><span class="trunc">${KIND_ONE[s.kind]} from ${esc(s.host || '')}, ${ago(s.created)}</span></span></button>`).join('');
+    $('#grid').innerHTML = data.saves.map(s => `<button class="card ${sel === s.id ? 'on' : ''}" data-id="${s.id}">${thumb(s)}<span class="m"><b class="trunc">${esc(s.title || s.host)}</b><span class="trunc">${s.kind === "taste" ? "Taste palette, " + ago(s.created) : `${KIND_ONE[s.kind] || "Save"} from ${esc(s.host || "")}, ${ago(s.created)}`}</span></span></button>`).join('');
   }
   drawDetail();
 }
@@ -53,12 +53,18 @@ async function drawDetail() {
     h += `<div><h2>Typeface<em>${esc(t.weight)}, ${esc(t.size)}</em></h2><div class="spec" style="font-family:${esc(t.stack)};font-style:${esc(t.style)}"><span style="font-size:40px;font-weight:${esc(t.weight)};line-height:1">${esc(t.family)}</span><span style="font-size:18px">${esc(t.sample || 'The quick brown fox jumps over the lazy dog')}</span><span style="font-size:12.5px;line-height:1.4">ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz 0123456789</span></div>
       <div class="vals" style="margin-top:8px"><div>Line height<b>${esc(t.lineHeight)}</b></div><div>Tracking<b>${esc(t.letterSpacing)}</b></div><div>Colour<b>${esc(t.color)}</b></div></div></div>`;
   }
-  if (look.colours && look.colours.length) h += `<div><h2>Colours<em>click to copy</em></h2>${look.colours.map(c => `<button class="col" data-copy="${esc(c.hex)}"><i style="background:${esc(c.hex)}"></i><b>${esc(c.hex.slice(1))}</b><span>${esc(c.role)}</span></button>`).join('')}</div>`;
-  if (look.faces && look.faces.length && s.kind !== 'type') h += `<div><h2>Type<em>${look.faces.length} ${look.faces.length === 1 ? 'face' : 'faces'}</em></h2>${look.faces.map(f => `<div class="face"><span class="s" style="font-family:${esc(f.stack)};font-weight:${esc(f.weight)}">${esc(f.family)}</span><div class="d"><span>${esc(f.role)}, ${esc(f.weight)}, ${esc(f.size)}</span><span>${esc(f.licence)}</span></div></div>`).join('')}</div>`;
-  if (look.values) h += `<div><h2>Values</h2><div class="vals"><div>Radius<b>${esc(look.values.radius)}</b></div><div>Measure<b>${esc(look.values.measure)}</b></div><div>Motion<b>${esc(look.values.motion)}</b></div></div></div>`;
+  if (look.colours && look.colours.length) h += `<div><h2>Colours<em>click to copy</em></h2>${look.colours.map(c => `<button class="col" data-copy="${esc(c.hex)}"><i style="background:${esc(c.hex)}"></i><b>${esc(c.hex.slice(1))}</b><span>${esc(s.kind === "taste" && c.from && c.from[0] ? c.from[0] : c.role)}</span></button>`).join('')}</div>`;
+  if (look.faces && look.faces.length && s.kind !== 'type') h += `<div><h2>Type<em>${look.faces.length} ${look.faces.length === 1 ? 'face' : 'faces'}</em></h2>${look.faces.map(f => `<div class="face"><span class="s" style="font-family:${esc(f.stack)};font-weight:${esc(f.weight)}">${esc(f.family)}</span><div class="d"><span>${esc([f.role, f.weight, f.size].filter(Boolean).join(", ") || (f.from || []).join(", "))}</span><span>${esc(f.licence)}</span></div></div>`).join('')}</div>`;
+  if (look.values) h += `<div><h2>Values</h2><div class="vals"><div>Radius<b>${esc(look.values.radius)}</b></div>${s.kind === "taste" ? `<div>Words<b>${esc(look.values.words || "None picked")}</b></div>` : `<div>Measure<b>${esc(look.values.measure)}</b></div>`}<div>Motion<b>${esc(look.values.motion)}</b></div></div></div>`;
+  if (s.taste) {
+    const r = s.taste;
+    h += `<div><h2>Taste<em>from ${r.count} sites you know</em></h2><div class="vals"><div>Lean<b>${esc(r.lean)}</b></div><div>Corners<b>${esc(r.radius)}</b></div><div>Motion<b>${esc(r.motion || '—')}</b></div></div>
+      ${(r.words || []).length || (r.drawn || []).length ? `<div class="tags" style="margin-top:8px">${(r.words || []).concat((r.drawn || []).map(d => 'drawn to ' + d)).map(w => `<span>${esc(w)}</span>`).join('')}</div>` : ''}
+      ${(r.loved || []).length ? `<div class="src" style="margin-top:10px;flex-wrap:wrap;gap:6px 10px">${r.loved.slice(0, 8).map(l => `<a href="#" data-open="${esc(l.url)}">${esc(l.host)}</a>`).join('')}</div>` : ''}</div>`;
+  }
   h += `<div><h2>Note</h2><textarea id="note" placeholder="Why you kept it">${esc(s.note || '')}</textarea></div>`;
   h += `<div><h2>Found by</h2><div class="tags">${(s.tags || []).slice(0, 24).map(t => `<span>${esc(t)}</span>`).join('')}</div></div>`;
-  h += `<div class="acts"><button class="btn pri" data-open="${esc(s.url)}">${icon('ext', 14)}Open page</button>${look.colours ? `<button class="btn" data-act="css">Copy as CSS</button>` : ''}${s.hasShot ? `<button class="btn" data-act="export">Export PNG</button>` : ''}<button class="btn" data-act="del">${icon('trash', 14)}Delete</button></div>`;
+  h += `<div class="acts">${s.kind === 'taste' ? `<button class="btn pri" data-open="aura://welcome/">${icon('ext', 14)}Find it again</button>` : `<button class="btn pri" data-open="${esc(s.url)}">${icon('ext', 14)}Open page</button>`}${look.colours ? `<button class="btn" data-act="css">Copy as CSS</button>` : ''}${s.hasShot ? `<button class="btn" data-act="export">Export PNG</button>` : ''}<button class="btn" data-act="del">${icon('trash', 14)}Delete</button></div>`;
   $('#det').innerHTML = h;
 }
 
