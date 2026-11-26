@@ -66,7 +66,8 @@ let showSources = false;
 const off = new Set(JSON.parse(localStorage.getItem('daily.off') || '[]'));
 const visible = (it) => !off.has(it.src);
 
-function draw() { if (LIVE && LIVE.items && LIVE.items.length) renderLive(); else render(); }
+function fitType() { document.querySelectorAll(".tfw").forEach(e => { let s = parseFloat(e.style.fontSize) || 40; while (s > 16 && (e.scrollWidth > e.clientWidth + 1 || e.parentElement.scrollHeight > e.parentElement.clientHeight + 1)) { s -= 2; e.style.fontSize = s + "px"; } }); }
+function draw() { if (LIVE && LIVE.items && LIVE.items.length) renderLive(); else render(); requestAnimationFrame(fitType); if (document.fonts) { document.fonts.ready.then(fitType); document.fonts.onloadingdone = fitType; } }
 
 function render() {
   const now = new Date();
