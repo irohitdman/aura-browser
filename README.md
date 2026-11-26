@@ -4,7 +4,13 @@ A Mac browser for designers that remembers what you save by how it looks. Built 
 
 ## Run it
 
-**Installed app.** Download `Aura-mac-arm64.zip` (Apple silicon) or `Aura-mac-x64.zip` (Intel) from Releases, unzip, and drag Aura.app to Applications. The app isn't notarised yet, so the first time, right-click Aura.app and choose Open. If macOS still refuses, open System Settings, Privacy & Security, and click Open Anyway, or run `xattr -cr /Applications/Aura.app` once in Terminal.
+**Installed app.** Download `Aura-0.1.0-mac-arm64.zip` from Releases (Apple silicon Macs), unzip it and drag Aura.app to Applications. This build isn't signed with a Developer ID yet, so macOS will say it's damaged until you sign it for your own Mac. Run this once in Terminal:
+
+```sh
+xattr -cr /Applications/Aura.app && codesign --force --deep --sign - /Applications/Aura.app
+```
+
+Then open Aura normally. A build made on your own Mac with `npm run dist:mac` doesn't need this.
 
 **From source.**
 
